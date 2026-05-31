@@ -91,21 +91,21 @@ function AlertMessage({ type, text }) {
   if (!text) return null;
   const className =
     type === "error"
-      ? "rounded-xl bg-red-100 text-red-700 px-4 py-3 text-sm"
-      : "rounded-xl bg-green-100 text-green-700 px-4 py-3 text-sm";
+      ? "rounded-lg bg-red-100 text-red-700 px-4 py-3 text-sm break-words"
+      : "rounded-lg bg-green-100 text-green-700 px-4 py-3 text-sm break-words";
 
   return <p className={className}>{text}</p>;
 }
 
 function BrandHeader({ title, subtitle }) {
   return (
-    <div className="flex flex-col items-center text-center gap-2">
-      <div className="h-9 w-9 rounded-lg border border-slate-200 bg-white grid place-items-center overflow-hidden">
-        <img src={appLogo} alt="Logo Fichad2" className="h-6 w-6 object-contain" />
+    <div className="flex min-w-0 flex-col items-center text-center gap-2">
+      <div className="grid h-12 w-12 place-items-center overflow-hidden rounded-lg border border-slate-200 bg-white shadow-sm sm:h-14 sm:w-14">
+        <img src={appLogo} alt="Logo Fichad2" className="h-9 w-9 object-contain sm:h-10 sm:w-10" />
       </div>
-      <div>
-        <h1 className="text-2xl font-bold text-slate-900">{title}</h1>
-        {subtitle && <p className="text-sm text-slate-600">{subtitle}</p>}
+      <div className="min-w-0">
+        <h1 className="text-xl font-bold leading-tight text-slate-900 sm:text-2xl">{title}</h1>
+        {subtitle && <p className="mt-1 text-sm leading-snug text-slate-600">{subtitle}</p>}
       </div>
     </div>
   );
@@ -128,7 +128,7 @@ function AuthView({
   infoMsg,
 }) {
   return (
-    <div className="max-w-md mx-auto bg-white p-8 rounded-2xl shadow-lg">
+    <div className="mx-auto w-full max-w-[420px] rounded-lg bg-white p-5 shadow-lg sm:p-8">
       <BrandHeader title="Control Horario" subtitle="Acceso seguro para tu equipo" />
 
       <div className="space-y-2 mt-6 mb-4">
@@ -137,14 +137,14 @@ function AuthView({
       </div>
 
       <input
-        className="border border-slate-300 w-full mb-3 p-4 rounded-xl text-base"
+        className="mb-3 w-full rounded-lg border border-slate-300 p-4 text-base"
         placeholder="Email"
         value={email}
         onChange={(e) => setEmail(e.target.value)}
       />
 
       <input
-        className="border border-slate-300 w-full mb-5 p-4 rounded-xl text-base"
+        className="mb-5 w-full rounded-lg border border-slate-300 p-4 text-base"
         type="password"
         placeholder="Contrasena"
         value={password}
@@ -154,7 +154,7 @@ function AuthView({
       {modoAltaEmpresa && (
         <div className="space-y-3 mb-5">
           <input
-            className="border border-slate-300 w-full p-4 rounded-xl text-base"
+            className="w-full rounded-lg border border-slate-300 p-4 text-base"
             placeholder="Nombre empresa"
             value={datosEmpresaAlta.name}
             onChange={(e) =>
@@ -162,7 +162,7 @@ function AuthView({
             }
           />
           <input
-            className="border border-slate-300 w-full p-4 rounded-xl text-base"
+            className="w-full rounded-lg border border-slate-300 p-4 text-base"
             placeholder="CIF"
             value={datosEmpresaAlta.cif}
             onChange={(e) =>
@@ -170,7 +170,7 @@ function AuthView({
             }
           />
           <input
-            className="border border-slate-300 w-full p-4 rounded-xl text-base"
+            className="w-full rounded-lg border border-slate-300 p-4 text-base"
             placeholder="Direccion"
             value={datosEmpresaAlta.address}
             onChange={(e) =>
@@ -178,7 +178,7 @@ function AuthView({
             }
           />
           <input
-            className="border border-slate-300 w-full p-4 rounded-xl text-base"
+            className="w-full rounded-lg border border-slate-300 p-4 text-base"
             placeholder="Responsable"
             value={datosEmpresaAlta.responsable}
             onChange={(e) =>
@@ -191,7 +191,7 @@ function AuthView({
       {!modoAltaEmpresa ? (
         <>
           <button
-            className="bg-blue-600 text-white w-full p-4 rounded-xl text-base font-semibold mb-3 disabled:opacity-60"
+            className="mb-3 w-full rounded-lg bg-blue-600 p-4 text-base font-semibold text-white disabled:opacity-60"
             onClick={iniciarSesion}
             disabled={busy}
           >
@@ -199,7 +199,7 @@ function AuthView({
           </button>
 
           <button
-            className="bg-green-600 text-white w-full p-4 rounded-xl text-base font-semibold mb-3 disabled:opacity-60"
+            className="mb-3 w-full rounded-lg bg-green-600 p-4 text-base font-semibold text-white disabled:opacity-60"
             onClick={registrarse}
             disabled={busy}
           >
@@ -208,7 +208,7 @@ function AuthView({
         </>
       ) : (
         <button
-          className="bg-indigo-600 text-white w-full p-4 rounded-xl text-base font-semibold mb-3 disabled:opacity-60"
+          className="mb-3 w-full rounded-lg bg-indigo-600 p-4 text-base font-semibold text-white disabled:opacity-60"
           onClick={crearEmpresaInicial}
           disabled={busy}
         >
@@ -260,7 +260,7 @@ function AdminPanel({
   }, [resumenTrabajadores]);
 
   return (
-    <div className="max-w-6xl mx-auto space-y-5 pb-20 md:pb-0">
+    <div className="mx-auto w-full max-w-[420px] space-y-4 pb-20 sm:max-w-2xl md:max-w-4xl lg:max-w-6xl md:pb-0">
       <BrandHeader title="Panel Administrador" subtitle="Gestion y control del equipo" />
 
       <div className="space-y-2">
@@ -268,23 +268,23 @@ function AdminPanel({
         <AlertMessage type="info" text={infoMsg} />
       </div>
 
-      <div className="bg-white p-4 md:p-5 rounded-2xl shadow space-y-3">
-        <h2 className="text-xl font-semibold text-gray-800">Filtro de reportes</h2>
+      <div className="space-y-3 rounded-lg bg-white p-4 shadow md:p-5">
+        <h2 className="text-lg font-semibold text-gray-800 sm:text-xl">Filtro de reportes</h2>
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
           <input
-            className="border border-slate-300 p-3 rounded-xl"
+            className="w-full rounded-lg border border-slate-300 p-3 text-base"
             type="date"
             value={dateFrom}
             onChange={(e) => setDateFrom(e.target.value)}
           />
           <input
-            className="border border-slate-300 p-3 rounded-xl"
+            className="w-full rounded-lg border border-slate-300 p-3 text-base"
             type="date"
             value={dateTo}
             onChange={(e) => setDateTo(e.target.value)}
           />
           <button
-            className="bg-blue-600 text-white px-5 py-3 rounded-xl font-semibold disabled:opacity-60"
+            className="w-full rounded-lg bg-blue-600 px-5 py-3 font-semibold text-white disabled:opacity-60"
             onClick={calcularDashboard}
             disabled={busy}
           >
@@ -293,20 +293,20 @@ function AdminPanel({
         </div>
       </div>
 
-      <div className="grid grid-cols-1 sm:grid-cols-2 xl:grid-cols-4 gap-4">
-        <div className="bg-white p-4 md:p-5 rounded-2xl shadow text-center">
+      <div className="grid grid-cols-1 gap-3 sm:grid-cols-2 xl:grid-cols-4">
+        <div className="rounded-lg bg-white p-4 text-center shadow md:p-5">
           <p className="text-sm text-gray-500">Trabajadores</p>
           <p className="text-2xl font-bold">{stats.totalTrabajadores}</p>
         </div>
-        <div className="bg-white p-4 md:p-5 rounded-2xl shadow text-center">
+        <div className="rounded-lg bg-white p-4 text-center shadow md:p-5">
           <p className="text-sm text-gray-500">Horas en rango</p>
           <p className="text-2xl font-bold">{stats.totalHorasMes}h</p>
         </div>
-        <div className="bg-white p-4 md:p-5 rounded-2xl shadow text-center">
+        <div className="rounded-lg bg-white p-4 text-center shadow md:p-5">
           <p className="text-sm text-gray-500">Mas activo</p>
           <p className="text-base md:text-lg font-semibold break-words">{stats.topTrabajador}</p>
         </div>
-        <div className="bg-white p-4 md:p-5 rounded-2xl shadow text-center">
+        <div className="rounded-lg bg-white p-4 text-center shadow md:p-5">
           <p className="text-sm text-gray-500">Sin fichar hoy</p>
           <p className="text-sm break-words">
             {stats.sinFicharHoy.length > 0 ? stats.sinFicharHoy.join(", ") : "Todos ficharon"}
@@ -314,13 +314,13 @@ function AdminPanel({
         </div>
       </div>
 
-      <div className="bg-white p-4 md:p-5 rounded-2xl shadow space-y-3">
+      <div className="space-y-3 rounded-lg bg-white p-4 shadow md:p-5">
         <div className="flex flex-col sm:flex-row sm:items-center sm:justify-between gap-3">
-          <h2 className="text-xl font-semibold text-gray-800">Control semanal de horas</h2>
-          <label className="text-sm text-slate-700 flex items-center gap-2">
+          <h2 className="text-lg font-semibold text-gray-800 sm:text-xl">Control semanal de horas</h2>
+          <label className="flex items-center gap-2 text-sm text-slate-700">
             Limite semanal
             <input
-              className="border border-slate-300 p-2 rounded-lg w-20 text-right"
+              className="w-20 rounded-lg border border-slate-300 p-2 text-right"
               type="number"
               min="1"
               max="80"
@@ -357,10 +357,10 @@ function AdminPanel({
                     : "bg-emerald-100 text-emerald-700";
 
               return (
-                <div key={row.id} className="rounded-xl border border-slate-200 p-3 space-y-2">
-                  <div className="flex items-center justify-between gap-2">
-                    <p className="text-sm font-medium break-all">{row.email || "sin email"}</p>
-                    <span className={`text-xs px-2 py-1 rounded-full ${statusClass}`}>
+                <div key={row.id} className="space-y-2 rounded-lg border border-slate-200 p-3">
+                  <div className="flex min-w-0 items-start justify-between gap-2">
+                    <p className="min-w-0 text-sm font-medium break-all">{row.email || "sin email"}</p>
+                    <span className={`shrink-0 rounded-full px-2 py-1 text-xs ${statusClass}`}>
                       {minutesToHours(row.minutosSemana)}h
                     </span>
                   </div>
@@ -383,29 +383,29 @@ function AdminPanel({
         )}
       </div>
 
-      <div className="bg-white p-4 md:p-5 rounded-2xl shadow space-y-3">
-        <h2 className="text-xl font-semibold text-gray-800">Datos de empresa</h2>
+      <div className="space-y-3 rounded-lg bg-white p-4 shadow md:p-5">
+        <h2 className="text-lg font-semibold text-gray-800 sm:text-xl">Datos de empresa</h2>
         <div className="grid grid-cols-1 md:grid-cols-2 gap-3">
           <input
-            className="border border-slate-300 p-3 rounded-xl"
+            className="w-full rounded-lg border border-slate-300 p-3 text-base"
             placeholder="Nombre"
             value={editEmpresa.name || ""}
             onChange={(e) => setEditEmpresa((prev) => ({ ...prev, name: e.target.value }))}
           />
           <input
-            className="border border-slate-300 p-3 rounded-xl"
+            className="w-full rounded-lg border border-slate-300 p-3 text-base"
             placeholder="CIF"
             value={editEmpresa.cif || ""}
             onChange={(e) => setEditEmpresa((prev) => ({ ...prev, cif: e.target.value }))}
           />
           <input
-            className="border border-slate-300 p-3 rounded-xl"
+            className="w-full rounded-lg border border-slate-300 p-3 text-base"
             placeholder="Direccion"
             value={editEmpresa.address || ""}
             onChange={(e) => setEditEmpresa((prev) => ({ ...prev, address: e.target.value }))}
           />
           <input
-            className="border border-slate-300 p-3 rounded-xl"
+            className="w-full rounded-lg border border-slate-300 p-3 text-base"
             placeholder="Responsable"
             value={editEmpresa.responsable || ""}
             onChange={(e) =>
@@ -414,7 +414,7 @@ function AdminPanel({
           />
         </div>
         <button
-          className="bg-indigo-600 text-white px-5 py-3 rounded-xl font-semibold disabled:opacity-60"
+          className="w-full rounded-lg bg-indigo-600 px-5 py-3 font-semibold text-white disabled:opacity-60 sm:w-auto"
           onClick={guardarEmpresa}
           disabled={busy}
         >
@@ -422,17 +422,17 @@ function AdminPanel({
         </button>
       </div>
 
-      <div className="bg-white p-4 md:p-5 rounded-2xl shadow space-y-3">
-        <h2 className="text-xl font-semibold text-gray-800">Invitar trabajador</h2>
+      <div className="space-y-3 rounded-lg bg-white p-4 shadow md:p-5">
+        <h2 className="text-lg font-semibold text-gray-800 sm:text-xl">Invitar trabajador</h2>
         <div className="flex flex-col md:flex-row gap-3">
           <input
-            className="border border-slate-300 p-3 rounded-xl flex-1"
+            className="w-full min-w-0 flex-1 rounded-lg border border-slate-300 p-3 text-base"
             placeholder="Email del trabajador"
             value={nuevoEmail}
             onChange={(e) => setNuevoEmail(e.target.value)}
           />
           <button
-            className="bg-green-600 text-white px-5 py-3 rounded-xl font-semibold disabled:opacity-60"
+            className="w-full rounded-lg bg-green-600 px-5 py-3 font-semibold text-white disabled:opacity-60 md:w-auto"
             onClick={crearTrabajador}
             disabled={busy}
           >
@@ -447,7 +447,7 @@ function AdminPanel({
           ) : (
             <ul className="text-sm text-gray-700 space-y-2">
               {trabajadores.map((item) => (
-                <li key={item.id} className="rounded-lg bg-slate-50 p-2">
+                <li key={item.id} className="rounded-lg bg-slate-50 p-3">
                   <p className="break-all">{item.email}</p>
                   <p className="text-xs text-slate-600">
                     {minutesToHours(resumenByUserId[item.id]?.minutosAcumulados || 0)}h totales
@@ -459,15 +459,15 @@ function AdminPanel({
         </div>
       </div>
 
-      <div className="bg-white p-4 md:p-5 rounded-2xl shadow space-y-3">
-        <h2 className="text-xl font-semibold text-gray-800">Resumen de horas</h2>
+      <div className="space-y-3 rounded-lg bg-white p-4 shadow md:p-5">
+        <h2 className="text-lg font-semibold text-gray-800 sm:text-xl">Resumen de horas</h2>
         {resumenTrabajadores.length === 0 ? (
           <p className="text-sm text-gray-500">Aun no hay datos de horas.</p>
         ) : (
           <>
             <div className="md:hidden space-y-2">
               {resumenTrabajadores.map((row) => (
-                <div key={row.id} className="rounded-xl border border-slate-200 p-3 space-y-1">
+                <div key={row.id} className="space-y-1 rounded-lg border border-slate-200 p-3">
                   <p className="text-sm font-medium break-all">{row.email || "sin email"}</p>
                   <p className="text-sm text-slate-600">
                     Horas en rango: {minutesToHours(row.minutosMes)}h
@@ -505,28 +505,28 @@ function AdminPanel({
 
       <div className="flex flex-col sm:flex-row sm:flex-wrap justify-center gap-3 pb-6">
         <button
-          className="w-full sm:w-auto bg-blue-600 text-white px-5 py-3 rounded-xl font-semibold disabled:opacity-60"
+          className="w-full rounded-lg bg-blue-600 px-5 py-3 font-semibold text-white disabled:opacity-60 sm:w-auto"
           onClick={calcularDashboard}
           disabled={busy}
         >
           {busy ? "Actualizando..." : "Actualizar dashboard"}
         </button>
         <button
-          className="w-full sm:w-auto bg-slate-700 text-white px-5 py-3 rounded-xl font-semibold disabled:opacity-60"
+          className="w-full rounded-lg bg-slate-700 px-5 py-3 font-semibold text-white disabled:opacity-60 sm:w-auto"
           onClick={descargarPDFTrabajadores}
           disabled={busy}
         >
           Descargar PDF trabajadores
         </button>
         <button
-          className="w-full sm:w-auto bg-slate-500 text-white px-5 py-3 rounded-xl font-semibold disabled:opacity-60"
+          className="w-full rounded-lg bg-slate-500 px-5 py-3 font-semibold text-white disabled:opacity-60 sm:w-auto"
           onClick={descargarCSVTrabajadores}
           disabled={busy}
         >
           Exportar CSV
         </button>
         <button
-          className="w-full sm:w-auto bg-red-600 text-white px-5 py-3 rounded-xl font-semibold"
+          className="w-full rounded-lg bg-red-600 px-5 py-3 font-semibold text-white sm:w-auto"
           onClick={cerrarSesion}
         >
           Cerrar sesion
@@ -553,8 +553,8 @@ function WorkerPanel({
   refrescarEstadoVerificacion,
 }) {
   return (
-    <div className="max-w-4xl mx-auto space-y-6">
-      <div className="bg-white p-8 rounded-2xl shadow-lg text-center">
+    <div className="mx-auto w-full max-w-[420px] space-y-4 sm:max-w-2xl md:max-w-4xl">
+      <div className="rounded-lg bg-white p-5 text-center shadow-lg sm:p-8">
         <BrandHeader title="Panel Trabajador" subtitle="Registra tu jornada en segundos" />
 
         <div className="space-y-2 mb-5 mt-6 text-left">
@@ -568,7 +568,7 @@ function WorkerPanel({
         </div>
 
         <button
-          className="bg-green-600 text-white max-w-xl mx-auto w-full p-4 rounded-xl text-base font-semibold mb-3 disabled:opacity-60"
+          className="mx-auto mb-3 w-full max-w-xl rounded-lg bg-green-600 p-4 text-base font-semibold text-white disabled:opacity-60"
           onClick={() => fichar("entrada")}
           disabled={busy || !emailVerified}
         >
@@ -576,7 +576,7 @@ function WorkerPanel({
         </button>
 
         <button
-          className="bg-red-600 text-white max-w-xl mx-auto w-full p-4 rounded-xl text-base font-semibold mb-4 disabled:opacity-60"
+          className="mx-auto mb-4 w-full max-w-xl rounded-lg bg-red-600 p-4 text-base font-semibold text-white disabled:opacity-60"
           onClick={() => fichar("salida")}
           disabled={busy || !emailVerified}
         >
@@ -587,14 +587,14 @@ function WorkerPanel({
           {!emailVerified && (
             <>
               <button
-                className="bg-amber-600 text-white max-w-xl mx-auto w-full p-4 rounded-xl text-base font-semibold disabled:opacity-60"
+                className="mx-auto w-full max-w-xl rounded-lg bg-amber-600 p-4 text-base font-semibold text-white disabled:opacity-60"
                 onClick={reenviarVerificacion}
                 disabled={busy}
               >
                 Reenviar verificacion
               </button>
               <button
-                className="bg-emerald-700 text-white max-w-xl mx-auto w-full p-4 rounded-xl text-base font-semibold disabled:opacity-60"
+                className="mx-auto w-full max-w-xl rounded-lg bg-emerald-700 p-4 text-base font-semibold text-white disabled:opacity-60"
                 onClick={refrescarEstadoVerificacion}
                 disabled={busy}
               >
@@ -603,14 +603,14 @@ function WorkerPanel({
             </>
           )}
           <button
-            className="bg-blue-600 text-white max-w-xl mx-auto w-full p-4 rounded-xl text-base font-semibold disabled:opacity-60"
+            className="mx-auto w-full max-w-xl rounded-lg bg-blue-600 p-4 text-base font-semibold text-white disabled:opacity-60"
             onClick={refrescarHistorial}
             disabled={busy}
           >
             Actualizar historial
           </button>
           <button
-            className="bg-gray-800 text-white max-w-xl mx-auto w-full p-4 rounded-xl text-base font-semibold"
+            className="mx-auto w-full max-w-xl rounded-lg bg-gray-800 p-4 text-base font-semibold text-white"
             onClick={cerrarSesion}
           >
             Cerrar sesion
@@ -618,48 +618,65 @@ function WorkerPanel({
         </div>
       </div>
 
-      <div className="bg-white p-4 rounded-2xl shadow overflow-x-auto">
+      <div className="rounded-lg bg-white p-4 shadow">
         <h2 className="text-lg font-semibold mb-3">Historial de fichajes</h2>
         {workerHistory.length === 0 ? (
           <p className="text-sm text-gray-500">Aun no tienes fichajes registrados.</p>
         ) : (
           <div className="space-y-3">
-            <table className="min-w-full text-sm">
-              <thead>
-                <tr className="text-left border-b">
-                  <th className="py-2 pr-4">Fecha</th>
-                  <th className="py-2 pr-4">Tipo</th>
-                  <th className="py-2 pr-4">Horas de sesion</th>
-                </tr>
-              </thead>
-              <tbody>
-                {workerHistory.map((item) => (
-                  <tr key={item.id} className="border-b">
-                    <td className="py-2 pr-4">{formatDateTime(item.date)}</td>
-                    <td className="py-2 pr-4">{item.tipo}</td>
-                    <td className="py-2 pr-4">
-                      {typeof item.minutosSesion === "number"
-                        ? `${minutesToHours(item.minutosSesion)}h`
-                        : "-"}
-                    </td>
-                  </tr>
-                ))}
-              </tbody>
-            </table>
+            <div className="space-y-2 md:hidden">
+              {workerHistory.map((item) => (
+                <div key={item.id} className="space-y-1 rounded-lg border border-slate-200 p-3 text-left">
+                  <p className="text-sm font-medium text-slate-900">{formatDateTime(item.date)}</p>
+                  <p className="text-sm text-slate-600">Tipo: {item.tipo}</p>
+                  <p className="text-sm text-slate-600">
+                    Horas de sesion:{" "}
+                    {typeof item.minutosSesion === "number"
+                      ? `${minutesToHours(item.minutosSesion)}h`
+                      : "-"}
+                  </p>
+                </div>
+              ))}
+            </div>
 
-            <div className="flex items-center justify-between">
+            <div className="hidden overflow-x-auto md:block">
+              <table className="min-w-full text-sm">
+                <thead>
+                  <tr className="text-left border-b">
+                    <th className="py-2 pr-4">Fecha</th>
+                    <th className="py-2 pr-4">Tipo</th>
+                    <th className="py-2 pr-4">Horas de sesion</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  {workerHistory.map((item) => (
+                    <tr key={item.id} className="border-b">
+                      <td className="py-2 pr-4">{formatDateTime(item.date)}</td>
+                      <td className="py-2 pr-4">{item.tipo}</td>
+                      <td className="py-2 pr-4">
+                        {typeof item.minutosSesion === "number"
+                          ? `${minutesToHours(item.minutosSesion)}h`
+                          : "-"}
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+            </div>
+
+            <div className="flex items-center justify-between gap-3">
               <button
-                className="bg-gray-200 px-3 py-1 rounded disabled:opacity-50"
+                className="rounded-lg bg-gray-200 px-3 py-2 text-sm disabled:opacity-50"
                 onClick={onPrevHistoryPage}
                 disabled={workerHistoryPage <= 1 || busy}
               >
                 Anterior
               </button>
-              <span className="text-sm text-gray-600">
+              <span className="text-center text-sm text-gray-600">
                 Pagina {workerHistoryPage} de {totalHistoryPages}
               </span>
               <button
-                className="bg-gray-200 px-3 py-1 rounded disabled:opacity-50"
+                className="rounded-lg bg-gray-200 px-3 py-2 text-sm disabled:opacity-50"
                 onClick={onNextHistoryPage}
                 disabled={workerHistoryPage >= totalHistoryPages || busy}
               >
@@ -1514,16 +1531,16 @@ function App() {
 
   if (loadingAuth) {
     return (
-      <div className="min-h-screen bg-gray-100 p-6 flex items-center justify-center">
+      <div className="flex min-h-screen items-center justify-center bg-gray-100 p-4 sm:p-6">
         <p className="text-gray-700">Cargando sesion...</p>
       </div>
     );
   }
 
   return (
-    <div className="min-h-screen bg-gradient-to-b from-blue-50 to-slate-100 p-6 md:p-8">
+    <div className="min-h-screen overflow-x-hidden bg-gradient-to-b from-blue-50 to-slate-100 px-4 py-5 sm:px-6 md:p-8">
       {!user ? (
-        <div className="min-h-[calc(100vh-3rem)] flex items-center justify-center">
+        <div className="flex min-h-[calc(100vh-2.5rem)] items-center justify-center">
           <AuthView
             email={email}
             password={password}
@@ -1568,7 +1585,7 @@ function App() {
           setWeeklyLimitHours={setWeeklyLimitHours}
         />
       ) : (
-        <div className="min-h-[calc(100vh-3rem)] flex flex-col justify-center">
+        <div className="flex min-h-[calc(100vh-2.5rem)] flex-col justify-center">
           <WorkerPanel
             errorMsg={errorMsg}
             infoMsg={infoMsg}
