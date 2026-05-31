@@ -1,0 +1,233 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    function signedIn() {
+      return request.auth != null;
+    }
+
+    function emailVerified() {
+      return signedIn() && request.auth.token.email_verified == true;
+    }
+
+    function serverTimestamp(value) {
+      return value == request.time;
+    }
+
+    function myUserDoc() {
+      return get(/databases/$(database)/documents/users/$(request.auth.uid));
+    }
+
+    function myCompanyId() {
+      return myUserDoc().data.companyId;
+    }
+
+    function isAdmin() {
+      return signedIn() && myUserDoc().data.role == "administrador";
+    }
+
+    function isSelf(uid) {
+      return signedIn() && request.auth.uid == uid;
+    }
+
+    function invitationByEmail(email) {
+      return get(/databases/$(database)/documents/invitations/$(email));
+    }
+
+    function invitationExists(email) {
+      return exists(/databases/$(database)/documents/invitations/$(email));
+    }
+
+    function validUserCreate(uid) {
+      return request.resource.data.keys().hasOnly([
+          "email",
+          "role",
+          "companyId",
+          "createdAt"
+        ])
+        && request.resource.data.email is string
+        && request.resource.data.email == request.auth.token.email
+        && serverTimestamp(request.resource.data.createdAt)
+        && invitationExists(request.resource.data.email)
+        && invitationByEmail(request.resource.data.email).data.role == "trabajador"
+        && request.resource.data.role == invitationByEmail(request.resource.data.email).data.role
+        && request.resource.data.companyId == invitationByEmail(request.resource.data.email).data.companyId
+        && isSelf(uid);
+    }
+
+    function validAdminBootstrapCreate(uid) {
+      return request.resource.data.keys().hasOnly([
+          "email",
+          "role",
+          "companyId",
+          "createdAt"
+        ])
+        && request.resource.data.email is string
+        && request.resource.data.email == request.auth.token.email
+        && request.resource.data.role == "administrador"
+        && serverTimestamp(request.resource.data.createdAt)
+        && isSelf(uid)
+        && exists(/databases/$(database)/documents/companies/$(request.resource.data.companyId))
+        && get(/databases/$(database)/documents/companies/$(request.resource.data.companyId)).data.ownerUid == request.auth.uid;
+    }
+
+    function validCompanyBootstrapCreate() {
+      return signedIn()
+        && request.resource.data.keys().hasOnly([
+          "name",
+          "cif",
+          "address",
+          "responsable",
+          "ownerUid",
+          "createdAt",
+          "updatedAt"
+        ])
+        && request.resource.data.name is string
+        && request.resource.data.cif is string
+        && request.resource.data.address is string
+        && request.resource.data.responsable is string
+        && request.resource.data.ownerUid == request.auth.uid
+        && serverTimestamp(request.resource.data.createdAt)
+        && serverTimestamp(request.resource.data.updatedAt);
+    }
+
+    function validCompanyUpdate() {
+      return request.resource.data.diff(resource.data).affectedKeys().hasOnly([
+          "name",
+          "cif",
+          "address",
+          "responsable",
+          "updatedAt"
+        ])
+        && request.resource.data.name is string
+        && request.resource.data.cif is string
+        && request.resource.data.address is string
+        && request.resource.data.responsable is string
+        && serverTimestamp(request.resource.data.updatedAt);
+    }
+
+    function validInvitationCreate(invitationId) {
+      return request.resource.data.keys().hasOnly([
+          "email",
+          "companyId",
+          "role",
+          "createdBy",
+          "createdByEmail",
+          "createdAt"
+        ])
+        && request.resource.data.email is string
+        && invitationId == request.resource.data.email
+        && request.resource.data.companyId == myCompanyId()
+        && request.resource.data.role == "trabajador"
+        && request.resource.data.createdBy == request.auth.uid
+        && request.resource.data.createdByEmail == request.auth.token.email
+        && serverTimestamp(request.resource.data.createdAt);
+    }
+
+    function validLogCreate() {
+      return (
+          request.resource.data.tipo == "entrada"
+          && request.resource.data.keys().hasOnly([
+            "userId",
+            "companyId",
+            "tipo",
+            "timestamp"
+          ])
+          && serverTimestamp(request.resource.data.timestamp)
+        ) || (
+          request.resource.data.tipo == "salida"
+          && request.resource.data.keys().hasOnly([
+            "userId",
+            "companyId",
+            "tipo",
+            "minutosSesion",
+            "entradaLogId",
+            "inicioSesion",
+            "timestamp"
+          ])
+          && request.resource.data.minutosSesion is int
+          && request.resource.data.minutosSesion >= 0
+          && request.resource.data.minutosSesion <= 1440
+          && request.resource.data.entradaLogId is string
+          && request.resource.data.inicioSesion is timestamp
+          && request.resource.data.inicioSesion <= request.time
+          && serverTimestamp(request.resource.data.timestamp)
+        );
+    }
+
+    match /users/{uid} {
+      allow create: if validUserCreate(uid) || validAdminBootstrapCreate(uid);
+
+      allow read: if isSelf(uid)
+        || (isAdmin() && resource.data.companyId == myCompanyId());
+
+      allow update, delete: if false;
+    }
+
+    match /companies/{companyId} {
+      allow create: if validCompanyBootstrapCreate();
+      allow read: if isAdmin() && companyId == myCompanyId();
+      allow update: if isAdmin()
+        && companyId == myCompanyId()
+        && validCompanyUpdate();
+      allow delete: if false;
+    }
+
+    match /invitations/{invitationId} {
+      allow create: if isAdmin() && validInvitationCreate(invitationId);
+
+      allow read: if (
+        isAdmin() && resource.data.companyId == myCompanyId()
+      ) || (
+        signedIn() && resource.data.email == request.auth.token.email
+      );
+
+      allow delete: if (
+        isAdmin() && resource.data.companyId == myCompanyId()
+      ) || (
+        signedIn() && resource.data.email == request.auth.token.email
+      );
+
+      allow update: if false;
+    }
+
+    match /logs/{logId} {
+      allow create: if emailVerified()
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.companyId == myCompanyId()
+        && validLogCreate();
+
+      allow read: if (
+        isAdmin() && resource.data.companyId == myCompanyId()
+      ) || (
+        signedIn() && resource.data.userId == request.auth.uid
+      );
+
+      allow update, delete: if false;
+    }
+
+    match /audit_logs/{auditId} {
+      allow create: if signedIn()
+        && request.resource.data.keys().hasOnly([
+          "companyId",
+          "userId",
+          "userEmail",
+          "role",
+          "accion",
+          "detalle",
+          "createdAt"
+        ])
+        && request.resource.data.userId == request.auth.uid
+        && request.resource.data.companyId == myCompanyId()
+        && request.resource.data.accion is string
+        && serverTimestamp(request.resource.data.createdAt);
+
+      allow read: if (
+        isAdmin() && resource.data.companyId == myCompanyId()
+      ) || (
+        signedIn() && resource.data.userId == request.auth.uid
+      );
+
+      allow update, delete: if false;
+    }
+  }
+}
