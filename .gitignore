@@ -1,1 +1,7 @@
 node_modules
+dist
+backup-cambios-fichad2.patch
+android/.idea
+android/.gradle
+android/build
+android/app/build
