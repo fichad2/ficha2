@@ -124,6 +124,7 @@ function AuthView({
   datosEmpresaAlta,
   setDatosEmpresaAlta,
   busy,
+  authAction,
   errorMsg,
   infoMsg,
 }) {
@@ -195,7 +196,7 @@ function AuthView({
             onClick={iniciarSesion}
             disabled={busy}
           >
-            {busy ? "Procesando..." : "Iniciar sesion"}
+            {authAction === "login" ? "Procesando..." : "Iniciar sesion"}
           </button>
 
           <button
@@ -203,7 +204,7 @@ function AuthView({
             onClick={registrarse}
             disabled={busy}
           >
-            {busy ? "Procesando..." : "Registrarse"}
+            {authAction === "register" ? "Procesando..." : "Registrarse"}
           </button>
         </>
       ) : (
@@ -212,7 +213,7 @@ function AuthView({
           onClick={crearEmpresaInicial}
           disabled={busy}
         >
-          {busy ? "Procesando..." : "Crear empresa y admin"}
+          {authAction === "company" ? "Procesando..." : "Crear empresa y admin"}
         </button>
       )}
 
@@ -246,6 +247,7 @@ function AdminPanel({
   calcularDashboard,
   descargarPDFTrabajadores,
   descargarCSVTrabajadores,
+  descargarCSVInspeccion,
   cerrarSesion,
   busy,
   weeklySummary,
@@ -526,6 +528,13 @@ function AdminPanel({
           Exportar CSV
         </button>
         <button
+          className="w-full rounded-lg bg-emerald-700 px-5 py-3 font-semibold text-white disabled:opacity-60 sm:w-auto"
+          onClick={descargarCSVInspeccion}
+          disabled={busy}
+        >
+          Exportar inspeccion
+        </button>
+        <button
           className="w-full rounded-lg bg-red-600 px-5 py-3 font-semibold text-white sm:w-auto"
           onClick={cerrarSesion}
         >
@@ -707,6 +716,7 @@ function App() {
 
   const [loadingAuth, setLoadingAuth] = useState(true);
   const [busy, setBusy] = useState(false);
+  const [authAction, setAuthAction] = useState(null);
   const [errorMsg, setErrorMsg] = useState("");
   const [infoMsg, setInfoMsg] = useState("");
 
@@ -923,11 +933,10 @@ function App() {
     }
 
     setBusy(true);
+    setAuthAction("login");
     try {
       const cred = await signInWithEmailAndPassword(auth, cleanEmail, password);
-      await reload(cred.user);
-      await getIdToken(cred.user, true);
-      const verifiedNow = Boolean(auth.currentUser?.emailVerified);
+      const verifiedNow = Boolean(cred.user.emailVerified);
       setEmailVerified(verifiedNow);
       if (!verifiedNow) {
         setInfoMsg("Sesion iniciada. Verifica tu email para poder fichar.");
@@ -936,6 +945,7 @@ function App() {
       setErrorMsg("No se pudo iniciar sesion: " + error.message);
     } finally {
       setBusy(false);
+      setAuthAction(null);
     }
   };
 
@@ -991,6 +1001,7 @@ function App() {
     }
 
     setBusy(true);
+    setAuthAction("register");
     try {
       const cred = await createUserWithEmailAndPassword(auth, cleanEmail, password);
       const invitacionRef = doc(db, "invitations", cleanEmail);
@@ -1032,6 +1043,7 @@ function App() {
       setErrorMsg("Error en registro: " + error.message);
     } finally {
       setBusy(false);
+      setAuthAction(null);
     }
   };
 
@@ -1052,6 +1064,7 @@ function App() {
     }
 
     setBusy(true);
+    setAuthAction("company");
     try {
       const cred = await createUserWithEmailAndPassword(auth, cleanEmail, password);
       const newCompanyId = generateCompanyId(cleanName);
@@ -1091,6 +1104,7 @@ function App() {
       setErrorMsg("No se pudo crear la empresa: " + error.message);
     } finally {
       setBusy(false);
+      setAuthAction(null);
     }
   };
 
@@ -1429,6 +1443,107 @@ function App() {
     }));
   };
 
+  const csvEscape = (value) => `"${String(value ?? "").replaceAll('"', '""')}"`;
+
+  const formatExportDateTime = (date) => {
+    if (!date) return "";
+    return date.toISOString();
+  };
+
+  const getWorkerName = (worker) => worker?.name || worker?.displayName || "No disponible";
+
+  const getSessionMinutes = (entrada, salida) => {
+    if (typeof salida?.minutosSesion === "number") return salida.minutosSesion;
+    if (entrada?.date && salida?.date && salida.date > entrada.date) {
+      return Math.floor((salida.date - entrada.date) / (1000 * 60));
+    }
+    return null;
+  };
+
+  const buildInspectionRows = (workers, logs, companyData) => {
+    const rows = [];
+    const workersById = workers.reduce((acc, worker) => {
+      acc[worker.id] = worker;
+      return acc;
+    }, {});
+    const logsByUser = {};
+
+    logs
+      .filter((item) => item.userId && item.date)
+      .forEach((item) => {
+        if (!logsByUser[item.userId]) logsByUser[item.userId] = [];
+        logsByUser[item.userId].push(item);
+      });
+
+    Object.entries(logsByUser).forEach(([userId, userLogs]) => {
+      const worker = workersById[userId] || { id: userId };
+      const ordered = userLogs.sort((a, b) => a.date - b.date);
+      const entradasById = new Map(
+        ordered.filter((log) => log.tipo === "entrada").map((log) => [log.id, log])
+      );
+      const entradasPendientes = [];
+      const usedEntradaIds = new Set();
+
+      ordered.forEach((log) => {
+        if (log.tipo === "entrada") {
+          entradasPendientes.push(log);
+          return;
+        }
+
+        if (log.tipo !== "salida") return;
+
+        let entrada = log.entradaLogId ? entradasById.get(log.entradaLogId) : null;
+        if (!entrada) {
+          entrada = entradasPendientes.find((item) => !usedEntradaIds.has(item.id)) || null;
+        }
+        if (entrada) usedEntradaIds.add(entrada.id);
+
+        rows.push({ worker, entrada, salida: log });
+      });
+
+      entradasPendientes
+        .filter((entrada) => !usedEntradaIds.has(entrada.id))
+        .forEach((entrada) => rows.push({ worker, entrada, salida: null }));
+    });
+
+    const filteredRows = rows.filter(({ entrada, salida }) => (
+      (entrada?.date && inRange(entrada.date, dateFrom, dateTo))
+      || (salida?.date && inRange(salida.date, dateFrom, dateTo))
+    ));
+    const finalRows = filteredRows.length > 0
+      ? filteredRows
+      : workers.map((worker) => ({ worker, entrada: null, salida: null }));
+    const totalPeriodMinutes = finalRows.reduce((sum, row) => {
+      const minutes = getSessionMinutes(row.entrada, row.salida);
+      return sum + (typeof minutes === "number" ? minutes : 0);
+    }, 0);
+    const generatedAt = new Date().toISOString();
+
+    return finalRows.map(({ worker, entrada, salida }) => {
+      const sessionMinutes = getSessionMinutes(entrada, salida);
+      return {
+        companyName: companyData.name || "No disponible",
+        companyCif: companyData.cif || "No disponible",
+        companyAddress: companyData.address || "No disponible",
+        companyResponsible: companyData.responsable || "No disponible",
+        workerName: getWorkerName(worker),
+        workerEmail: worker.email || "No disponible",
+        workerId: worker.id || "No disponible",
+        dateFrom: dateFrom || "inicio",
+        dateTo: dateTo || "hoy",
+        generatedAt,
+        entradaTimestamp: formatExportDateTime(entrada?.date),
+        salidaTimestamp: formatExportDateTime(salida?.date),
+        sessionMinutes: typeof sessionMinutes === "number" ? sessionMinutes : "",
+        sessionHours: typeof sessionMinutes === "number" ? minutesToHours(sessionMinutes) : "",
+        totalPeriodHours: minutesToHours(totalPeriodMinutes),
+        entradaLogId: entrada?.id || "",
+        salidaLogId: salida?.id || "",
+        entradaLogIdPairing: salida?.entradaLogId || "",
+      };
+    });
+  };
+
   const descargarPDFTrabajadores = async () => {
     clearMessages();
 
@@ -1517,6 +1632,93 @@ function App() {
     registrarAuditoria("export_csv", { dateFrom, dateTo, totalFilas: rows.length });
   };
 
+  const descargarCSVInspeccion = async () => {
+    clearMessages();
+    setBusy(true);
+
+    try {
+      const workers = trabajadores.length > 0 ? trabajadores : await cargarTrabajadores();
+      const companySnap = await getDoc(doc(db, "companies", companyId));
+      const companyData = companySnap.exists() ? companySnap.data() : editEmpresa;
+      const logsQuery = query(collection(db, "logs"), where("companyId", "==", companyId));
+      const logsSnap = await getDocs(logsQuery);
+      const logs = logsSnap.docs
+        .map((item) => ({ id: item.id, ...item.data(), date: parseLogDate(item.data().timestamp) }))
+        .filter((item) => item.date);
+      const rows = buildInspectionRows(workers, logs, companyData || {});
+
+      if (rows.length === 0) {
+        setErrorMsg("No hay datos para exportar.");
+        return;
+      }
+
+      const header = [
+        "company_name",
+        "company_cif",
+        "company_address",
+        "company_responsible",
+        "worker_name",
+        "worker_email",
+        "worker_id",
+        "date_from",
+        "date_to",
+        "generated_at",
+        "entrada_timestamp",
+        "salida_timestamp",
+        "session_minutes",
+        "session_hours",
+        "total_period_hours",
+        "entrada_log_id",
+        "salida_log_id",
+        "entrada_log_id_pairing",
+      ];
+      const body = rows.map((row) => [
+        row.companyName,
+        row.companyCif,
+        row.companyAddress,
+        row.companyResponsible,
+        row.workerName,
+        row.workerEmail,
+        row.workerId,
+        row.dateFrom,
+        row.dateTo,
+        row.generatedAt,
+        row.entradaTimestamp,
+        row.salidaTimestamp,
+        row.sessionMinutes,
+        row.sessionHours,
+        row.totalPeriodHours,
+        row.entradaLogId,
+        row.salidaLogId,
+        row.entradaLogIdPairing,
+      ]);
+      const csvContent = [header, ...body]
+        .map((line) => line.map(csvEscape).join(","))
+        .join("\n");
+      const blob = new Blob([csvContent], { type: "text/csv;charset=utf-8;" });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+
+      link.href = url;
+      link.setAttribute("download", `inspeccion_laboral_${Date.now()}.csv`);
+      document.body.appendChild(link);
+      link.click();
+      document.body.removeChild(link);
+      URL.revokeObjectURL(url);
+
+      await registrarAuditoria("export_inspeccion_csv", {
+        dateFrom,
+        dateTo,
+        totalFilas: rows.length,
+      });
+      setInfoMsg("Exportacion de inspeccion generada correctamente.");
+    } catch (error) {
+      setErrorMsg("No se pudo generar la exportacion de inspeccion: " + error.message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   const cerrarSesion = async () => {
     await signOut(auth);
   };
@@ -1554,6 +1756,7 @@ function App() {
             datosEmpresaAlta={datosEmpresaAlta}
             setDatosEmpresaAlta={setDatosEmpresaAlta}
             busy={busy}
+            authAction={authAction}
             errorMsg={errorMsg}
             infoMsg={infoMsg}
           />
@@ -1578,6 +1781,7 @@ function App() {
           calcularDashboard={calcularDashboard}
           descargarPDFTrabajadores={descargarPDFTrabajadores}
           descargarCSVTrabajadores={descargarCSVTrabajadores}
+          descargarCSVInspeccion={descargarCSVInspeccion}
           cerrarSesion={cerrarSesion}
           busy={busy}
           weeklySummary={weeklySummary}
