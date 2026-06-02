@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 import { auth, db } from "./firebase";
 import appLogo from "../logo.png";
 import {
@@ -721,6 +721,7 @@ function App() {
   const [loadingAuth, setLoadingAuth] = useState(true);
   const [busy, setBusy] = useState(false);
   const [authAction, setAuthAction] = useState(null);
+  const registrationInProgressRef = useRef(false);
   const [errorMsg, setErrorMsg] = useState("");
   const [infoMsg, setInfoMsg] = useState("");
 
@@ -838,6 +839,10 @@ function App() {
       clearMessages();
 
       if (userAuth) {
+        if (registrationInProgressRef.current) {
+          setLoadingAuth(false);
+          return;
+        }
         await cargarRol(userAuth);
       } else {
         setRol(null);
@@ -1006,8 +1011,18 @@ function App() {
 
     setBusy(true);
     setAuthAction("register");
+    registrationInProgressRef.current = true;
     try {
-      const cred = await createUserWithEmailAndPassword(auth, cleanEmail, password);
+      let cred;
+      try {
+        cred = await createUserWithEmailAndPassword(auth, cleanEmail, password);
+      } catch (error) {
+        if (error.code !== "auth/email-already-in-use") {
+          throw error;
+        }
+        cred = await signInWithEmailAndPassword(auth, cleanEmail, password);
+      }
+
       const invitacionRef = doc(db, "invitations", cleanEmail);
       let invitacionSnap = await getDoc(invitacionRef);
       let invitacionToDeleteRef = invitacionRef;
@@ -1040,12 +1055,14 @@ function App() {
       });
 
       await deleteDoc(invitacionToDeleteRef);
+      await cargarRol(cred.user);
       setInfoMsg("Registro completado correctamente.");
       setEmail("");
       setPassword("");
     } catch (error) {
       setErrorMsg("Error en registro: " + error.message);
     } finally {
+      registrationInProgressRef.current = false;
       setBusy(false);
       setAuthAction(null);
     }
