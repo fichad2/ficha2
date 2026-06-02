@@ -818,6 +818,7 @@ function App() {
         await applyActionCode(auth, oobCode);
         if (auth.currentUser) {
           await reload(auth.currentUser);
+          await getIdToken(auth.currentUser, true);
           setEmailVerified(Boolean(auth.currentUser.emailVerified));
         }
         setInfoMsg("Email verificado correctamente. Ya puedes fichar.");
@@ -1248,11 +1249,14 @@ function App() {
     if (!workerEmailVerified) {
       try {
         await reload(auth.currentUser);
+        await getIdToken(auth.currentUser, true);
         const verifiedNow = Boolean(auth.currentUser?.emailVerified);
         setEmailVerified(verifiedNow);
       } catch {
         // Si falla el refresh, se mantiene la validacion actual.
       }
+    } else if (auth.currentUser) {
+      await getIdToken(auth.currentUser, true);
     }
     if (!Boolean(auth.currentUser?.emailVerified)) {
       setErrorMsg("Debes verificar tu email antes de fichar.");
