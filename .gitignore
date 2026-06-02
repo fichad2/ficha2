@@ -5,6 +5,7 @@ backup-cambios-fichad2.patch
 .env.production
 firebase-debug.log
 firestore-debug.log
+.firebase/
 *serviceAccount*.json
 serviceAccount*.json
 android/.idea
