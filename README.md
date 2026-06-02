@@ -1,33 +1,102 @@
-﻿# ficha2
+# Fichad2
 
-## Alta autoservicio en la app
+Multi-company time tracking SaaS for web/PWA access.
 
-Flujo para una empresa nueva (sin Firebase Console):
+## Environment separation
 
-1. En login, pulsar `Soy empresa nueva: crear alta inicial`.
-2. Rellenar email, contrasena y datos de empresa.
-3. Pulsar `Crear empresa y admin`.
-4. Verificar email.
-5. Entrar al panel admin y crear invitaciones de trabajadores.
+The app loads Firebase web config from Vite environment variables in `src/firebase.js`.
 
-Importante: para que esto funcione, debes publicar las reglas nuevas de Firestore:
+Local emulator QA:
 
 ```powershell
-firebase deploy --only firestore:rules
+Copy-Item .env.local.example .env.local
+npm run dev
 ```
 
-## Alta rapida de cliente
+For LAN/mobile emulator QA, set:
 
-Comando unico para crear empresa + admin en Firebase:
+```text
+VITE_USE_FIREBASE_EMULATORS=true
+VITE_FIREBASE_EMULATOR_HOST=192.168.x.x
+```
+
+Production pilot:
+
+```powershell
+Copy-Item .env.production.example .env.production
+npm run build
+```
+
+Production must use:
+
+```text
+VITE_USE_FIREBASE_EMULATORS=false
+VITE_ENABLE_COMPANY_SIGNUP=false
+```
+
+To verify the production build is not using emulators, inspect the built app environment before deploy and confirm:
+
+- `VITE_USE_FIREBASE_EMULATORS=false`
+- `VITE_FIREBASE_EMULATOR_HOST` is empty or unused
+- the deployed Firebase project ID matches the real production project
+
+## Private one-company pilot
+
+1. Create or select the production Firebase project.
+2. Enable Email/Password Auth.
+3. Add the private URL to Firebase Auth authorized domains.
+4. Fill `.env.production` with the Firebase web app config.
+5. Keep `VITE_ENABLE_COMPANY_SIGNUP=false`.
+6. Run `npm run build`.
+7. Deploy Firestore rules only after `npm run test:rules` passes.
+8. Deploy Hosting only after explicit approval.
+
+## Create first real company and admin
+
+Use the controlled onboarding script with a production service account kept outside the repo:
 
 ```powershell
 npm run onboard:client -- "C:\ruta\serviceAccount.json" --company-name "Empresa Demo SL" --admin-email "admin@empresademo.com" --cif "B12345678" --address "Calle Mayor 1" --responsable "Nombre Apellido"
 ```
 
-Opciones:
+Options:
 
-- `--company-id`: fija un ID de empresa manual.
-- `--admin-password`: fija la contrasena inicial del admin.
+- `--company-id`: fixed company ID.
+- `--admin-password`: initial admin password.
 
-Si no pasas `--admin-password`, el script genera una temporal y la muestra por consola.
-Tambien imprime links de verificacion de email y cambio de contrasena.
+If `--admin-password` is omitted, the script generates a temporary password and prints it once. It also prints email verification and password reset links.
+
+## Worker invitation flow
+
+1. Admin logs in after email verification.
+2. Admin creates worker invitations from the admin panel.
+3. Worker registers with the invited email.
+4. Worker verifies email.
+5. Worker can clock entrada/salida.
+6. Admin verifies logs and exports from the dashboard.
+
+## Self-service company signup
+
+The login screen can show `Soy empresa nueva: crear alta inicial` only when:
+
+```text
+VITE_ENABLE_COMPANY_SIGNUP=true
+```
+
+Keep it `false` for the private production pilot.
+
+## Firebase deploy commands
+
+Rules only:
+
+```powershell
+firebase deploy --only firestore:rules
+```
+
+Hosting only:
+
+```powershell
+firebase deploy --only hosting
+```
+
+Do not deploy production until the target Firebase project, environment file, build, rules tests, and manual pilot checklist are approved.

@@ -1,6 +1,12 @@
 node_modules
 dist
 backup-cambios-fichad2.patch
+.env.local
+.env.production
+firebase-debug.log
+firestore-debug.log
+*serviceAccount*.json
+serviceAccount*.json
 android/.idea
 android/.gradle
 android/build

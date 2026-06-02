@@ -127,6 +127,7 @@ function AuthView({
   authAction,
   errorMsg,
   infoMsg,
+  companySignupEnabled,
 }) {
   return (
     <div className="mx-auto w-full max-w-[420px] rounded-lg bg-white p-5 shadow-lg sm:p-8">
@@ -207,7 +208,7 @@ function AuthView({
             {authAction === "register" ? "Procesando..." : "Registrarse"}
           </button>
         </>
-      ) : (
+      ) : companySignupEnabled ? (
         <button
           className="mb-3 w-full rounded-lg bg-indigo-600 p-4 text-base font-semibold text-white disabled:opacity-60"
           onClick={crearEmpresaInicial}
@@ -215,15 +216,17 @@ function AuthView({
         >
           {authAction === "company" ? "Procesando..." : "Crear empresa y admin"}
         </button>
-      )}
+      ) : null}
 
-      <button
-        className="text-sm text-slate-700 underline w-full"
-        onClick={() => setModoAltaEmpresa((prev) => !prev)}
-        disabled={busy}
-      >
-        {modoAltaEmpresa ? "Volver a acceso normal" : "Soy empresa nueva: crear alta inicial"}
-      </button>
+      {companySignupEnabled && (
+        <button
+          className="text-sm text-slate-700 underline w-full"
+          onClick={() => setModoAltaEmpresa((prev) => !prev)}
+          disabled={busy}
+        >
+          {modoAltaEmpresa ? "Volver a acceso normal" : "Soy empresa nueva: crear alta inicial"}
+        </button>
+      )}
     </div>
   );
 }
@@ -700,6 +703,7 @@ function WorkerPanel({
 }
 
 function App() {
+  const companySignupEnabled = import.meta.env.VITE_ENABLE_COMPANY_SIGNUP === "true";
   const [email, setEmail] = useState("");
   const [password, setPassword] = useState("");
   const [user, setUser] = useState(null);
@@ -1759,6 +1763,7 @@ function App() {
             authAction={authAction}
             errorMsg={errorMsg}
             infoMsg={infoMsg}
+            companySignupEnabled={companySignupEnabled}
           />
         </div>
       ) : rol === "administrador" ? (
