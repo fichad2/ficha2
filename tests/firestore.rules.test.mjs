@@ -1,3 +1,4 @@
+import { assertEmulatorEnvironment } from "../functions/src/emulator-environment.js";
 import { readFileSync } from "node:fs";
 import { beforeEach, after, describe, test } from "node:test";
 import {
@@ -18,12 +19,18 @@ import {
   where,
 } from "firebase/firestore";
 
-const PROJECT_ID = "fichad2";
+const phase3Local = process.env.FICHAD2_LOCAL_ONLY === "true";
+const PROJECT_ID = phase3Local ? assertEmulatorEnvironment(process.env).projectId : "fichad2";
+
+// Alternate rules are tested only inside the pinned demo environment.
+const alternateRules = process.env.FICHAD2_RULES_VARIANT === "phase3";
+if (alternateRules) assertEmulatorEnvironment(process.env);
+const rulesFile = alternateRules ? "firestore.phase3-local.rules" : "firestore.rules";
 
 const testEnv = await initializeTestEnvironment({
   projectId: PROJECT_ID,
   firestore: {
-    rules: readFileSync("firestore.rules", "utf8"),
+    rules: readFileSync(rulesFile, "utf8"),
   },
 });
 
@@ -111,6 +118,7 @@ beforeEach(async () => {
 });
 
 after(async () => {
+  if (phase3Local) await testEnv.clearFirestore(); // Only the pinned demo emulator.
   await testEnv.cleanup();
 });
 

@@ -1,5 +1,6 @@
 import React, { useEffect, useMemo, useRef, useState } from "react";
 import { auth, db } from "./firebase";
+import { buildSessionView, buildSharedReport, historyDurationLabel, formatReportDate, madridDay } from "./session-reporting.js";
 import appLogo from "../logo.png";
 import {
   applyActionCode,
@@ -233,6 +234,8 @@ function AuthView({
 
 function AdminPanel({
   stats,
+  sessionReportNotice,
+  sessionReportReady,
   errorMsg,
   infoMsg,
   editEmpresa,
@@ -271,10 +274,12 @@ function AdminPanel({
       <div className="space-y-2">
         <AlertMessage type="error" text={errorMsg} />
         <AlertMessage type="info" text={infoMsg} />
+        <AlertMessage type={sessionReportReady ? "info" : "error"} text={sessionReportNotice} />
       </div>
 
       <div className="space-y-3 rounded-lg bg-white p-4 shadow md:p-5">
         <h2 className="text-lg font-semibold text-gray-800 sm:text-xl">Filtro de reportes</h2>
+        <p className="text-xs text-slate-600">Fechas en Europe/Madrid. Los minutos se reparten por días naturales. Aplica el filtro antes de exportar.</p>
         <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-3">
           <input
             className="w-full rounded-lg border border-slate-300 p-3 text-base"
@@ -304,7 +309,7 @@ function AdminPanel({
           <p className="text-2xl font-bold">{stats.totalTrabajadores}</p>
         </div>
         <div className="rounded-lg bg-white p-4 text-center shadow md:p-5">
-          <p className="text-sm text-gray-500">Horas en rango</p>
+          <p className="text-sm text-gray-500">Horas cuantificadas en rango</p>
           <p className="text-2xl font-bold">{stats.totalHorasMes}h</p>
         </div>
         <div className="rounded-lg bg-white p-4 text-center shadow md:p-5">
@@ -349,7 +354,9 @@ function AdminPanel({
               const limitMinutes = weeklyLimitHours * 60;
               const ratio = limitMinutes > 0 ? row.minutosSemana / limitMinutes : 0;
               const status =
-                row.minutosSemana >= limitMinutes
+                row.unknownWeek > 0
+                  ? "incompleto"
+                  : row.minutosSemana >= limitMinutes
                   ? "exceso"
                   : row.minutosSemana >= limitMinutes * 0.9
                     ? "riesgo"
@@ -357,7 +364,7 @@ function AdminPanel({
               const statusClass =
                 status === "exceso"
                   ? "bg-red-100 text-red-700"
-                  : status === "riesgo"
+                  : status === "riesgo" || status === "incompleto"
                     ? "bg-amber-100 text-amber-700"
                     : "bg-emerald-100 text-emerald-700";
 
@@ -367,6 +374,7 @@ function AdminPanel({
                     <p className="min-w-0 text-sm font-medium break-all">{row.email || "sin email"}</p>
                     <span className={`shrink-0 rounded-full px-2 py-1 text-xs ${statusClass}`}>
                       {minutesToHours(row.minutosSemana)}h
+                      {row.unknownWeek > 0 && ` + ${row.unknownWeek} desconocidas`}
                     </span>
                   </div>
                   <div className="h-2 bg-slate-100 rounded-full overflow-hidden">
@@ -374,7 +382,7 @@ function AdminPanel({
                       className={`h-full ${
                         status === "exceso"
                           ? "bg-red-500"
-                          : status === "riesgo"
+                          : status === "riesgo" || status === "incompleto"
                             ? "bg-amber-500"
                             : "bg-emerald-500"
                       }`}
@@ -456,6 +464,7 @@ function AdminPanel({
                   <p className="break-all">{item.email}</p>
                   <p className="text-xs text-slate-600">
                     {minutesToHours(resumenByUserId[item.id]?.minutosAcumulados || 0)}h totales
+                    {resumenByUserId[item.id]?.unknownTotal > 0 && ` cuantificadas; ${resumenByUserId[item.id].unknownTotal} jornadas desconocidas`}
                   </p>
                 </li>
               ))}
@@ -476,9 +485,11 @@ function AdminPanel({
                   <p className="text-sm font-medium break-all">{row.email || "sin email"}</p>
                   <p className="text-sm text-slate-600">
                     Horas en rango: {minutesToHours(row.minutosMes)}h
+                    {row.unknownPeriod > 0 && ` cuantificadas; ${row.unknownPeriod} jornadas desconocidas`}
                   </p>
                   <p className="text-sm text-slate-600">
                     Horas totales: {minutesToHours(row.minutosAcumulados)}h
+                    {row.unknownTotal > 0 && ` cuantificadas; ${row.unknownTotal} jornadas desconocidas`}
                   </p>
                 </div>
               ))}
@@ -497,8 +508,8 @@ function AdminPanel({
                   {resumenTrabajadores.map((row) => (
                     <tr key={row.id} className="border-b">
                       <td className="py-2 pr-4 break-all">{row.email || "sin email"}</td>
-                      <td className="py-2 pr-4">{minutesToHours(row.minutosMes)}h</td>
-                      <td className="py-2 pr-4">{minutesToHours(row.minutosAcumulados)}h</td>
+                      <td className="py-2 pr-4">{minutesToHours(row.minutosMes)}h{row.unknownPeriod > 0 && ` cuantificadas; ${row.unknownPeriod} desconocidas`}</td>
+                      <td className="py-2 pr-4">{minutesToHours(row.minutosAcumulados)}h{row.unknownTotal > 0 && ` cuantificadas; ${row.unknownTotal} desconocidas`}</td>
                     </tr>
                   ))}
                 </tbody>
@@ -519,21 +530,21 @@ function AdminPanel({
         <button
           className="w-full rounded-lg bg-slate-700 px-5 py-3 font-semibold text-white disabled:opacity-60 sm:w-auto"
           onClick={descargarPDFTrabajadores}
-          disabled={busy}
+          disabled={busy || !sessionReportReady}
         >
           Descargar PDF trabajadores
         </button>
         <button
           className="w-full rounded-lg bg-slate-500 px-5 py-3 font-semibold text-white disabled:opacity-60 sm:w-auto"
           onClick={descargarCSVTrabajadores}
-          disabled={busy}
+          disabled={busy || !sessionReportReady}
         >
           Exportar CSV
         </button>
         <button
           className="w-full rounded-lg bg-emerald-700 px-5 py-3 font-semibold text-white disabled:opacity-60 sm:w-auto"
           onClick={descargarCSVInspeccion}
-          disabled={busy}
+          disabled={busy || !sessionReportReady}
         >
           Exportar inspeccion
         </button>
@@ -555,6 +566,7 @@ function WorkerPanel({
   cerrarSesion,
   busy,
   workerHistory,
+  workerSessionNotice,
   workerHistoryPage,
   totalHistoryPages,
   onPrevHistoryPage,
@@ -572,6 +584,7 @@ function WorkerPanel({
         <div className="space-y-2 mb-5 mt-6 text-left">
           <AlertMessage type="error" text={errorMsg} />
           <AlertMessage type="info" text={infoMsg} />
+          <AlertMessage type="info" text={workerSessionNotice} />
           {!emailVerified && (
             <p className="rounded bg-yellow-100 text-yellow-800 px-3 py-2 text-sm">
               Tu email no esta verificado. Verificalo para fichar.
@@ -638,15 +651,18 @@ function WorkerPanel({
           <div className="space-y-3">
             <div className="space-y-2 md:hidden">
               {workerHistory.map((item) => (
-                <div key={item.id} className="space-y-1 rounded-lg border border-slate-200 p-3 text-left">
-                  <p className="text-sm font-medium text-slate-900">{formatDateTime(item.date)}</p>
+                <div key={`${item.id ?? "sin-id"}:${item.sourceIndex}`} className="space-y-1 rounded-lg border border-slate-200 p-3 text-left">
+                  <p className="text-sm font-medium text-slate-900">{formatReportDate(item.timestamp)} (Madrid)</p>
                   <p className="text-sm text-slate-600">Tipo: {item.tipo}</p>
                   <p className="text-sm text-slate-600">
                     Horas de sesion:{" "}
-                    {typeof item.minutosSesion === "number"
-                      ? `${minutesToHours(item.minutosSesion)}h`
-                      : "-"}
+                    {historyDurationLabel(item)}
                   </p>
+                  <p className="text-xs text-slate-600">{item.reportStatus}</p>
+                  {item.reportDetails && <p className="text-xs text-amber-800">{item.reportDetails}</p>}
+                  {item.issues?.some((issue) => issue.blocking) && Number.isFinite(item.minutosSesion) && (
+                    <p className="text-xs text-amber-800">Duración guardada: {minutesToHours(item.minutosSesion)}h; requiere revisión.</p>
+                  )}
                 </div>
               ))}
             </div>
@@ -662,13 +678,16 @@ function WorkerPanel({
                 </thead>
                 <tbody>
                   {workerHistory.map((item) => (
-                    <tr key={item.id} className="border-b">
-                      <td className="py-2 pr-4">{formatDateTime(item.date)}</td>
+                    <tr key={`${item.id ?? "sin-id"}:${item.sourceIndex}`} className="border-b">
+                      <td className="py-2 pr-4">{formatReportDate(item.timestamp)} (Madrid)</td>
                       <td className="py-2 pr-4">{item.tipo}</td>
                       <td className="py-2 pr-4">
-                        {typeof item.minutosSesion === "number"
-                          ? `${minutesToHours(item.minutosSesion)}h`
-                          : "-"}
+                        {historyDurationLabel(item)}
+                        <p className="text-xs text-slate-600">{item.reportStatus}</p>
+                        {item.reportDetails && <p className="text-xs text-amber-800">{item.reportDetails}</p>}
+                        {item.issues?.some((issue) => issue.blocking) && Number.isFinite(item.minutosSesion) && (
+                          <p className="text-xs text-amber-800">Duración guardada: {minutesToHours(item.minutosSesion)}h; requiere revisión.</p>
+                        )}
                       </td>
                     </tr>
                   ))}
@@ -735,13 +754,17 @@ function App() {
   const [trabajadores, setTrabajadores] = useState([]);
   const [nuevoEmail, setNuevoEmail] = useState("");
   const [resumenTrabajadores, setResumenTrabajadores] = useState([]);
+  const [sessionReport, setSessionReport] = useState(null);
+  const sessionReportMatchesContext = Boolean(sessionReport && sessionReport.companyId === companyId
+    && sessionReport.viewerUid === user?.uid);
 
   const [workerHistory, setWorkerHistory] = useState([]);
+  const [workerSessionNotice, setWorkerSessionNotice] = useState("");
   const [workerHistoryPage, setWorkerHistoryPage] = useState(1);
   const workerHistoryPageSize = 15;
 
-  const [dateFrom, setDateFrom] = useState(toInputDate(startOfCurrentMonth()));
-  const [dateTo, setDateTo] = useState(toInputDate(endOfToday()));
+  const [dateFrom, setDateFrom] = useState(() => `${madridDay(new Date()).slice(0, 7)}-01`);
+  const [dateTo, setDateTo] = useState(() => madridDay(new Date()));
 
   const [stats, setStats] = useState({
     totalTrabajadores: 0,
@@ -850,8 +873,10 @@ function App() {
         setCompanyId(null);
         setTrabajadores([]);
         setResumenTrabajadores([]);
+        setSessionReport(null);
         setWeeklySummary([]);
         setWorkerHistory([]);
+        setWorkerSessionNotice("");
         setWorkerHistoryPage(1);
         setEmailVerified(false);
       }
@@ -1420,12 +1445,22 @@ function App() {
       const logsQuery = query(collection(db, "logs"), where("companyId", "==", companyId));
       const logsSnap = await getDocs(logsQuery);
       const logs = logsSnap.docs
-        .map((item) => ({ ...item.data(), date: parseLogDate(item.data().timestamp) }))
-        .filter((item) => item.date);
+        .map((item) => ({ ...item.data(), id: item.id }));
 
-      buildDashboardFromData(workers, logs);
-      setInfoMsg("Dashboard actualizado.");
+      const report = buildSharedReport(logs, workers, { from: dateFrom, to: dateTo, now: new Date() });
+      setSessionReport({ ...report, companyId, viewerUid: user?.uid });
+      if (report.ready) {
+        setResumenTrabajadores(report.summary);
+        setWeeklySummary(report.weeklySummary);
+        setStats(report.stats);
+        setInfoMsg("Dashboard actualizado. Fechas en Europe/Madrid.");
+      } else {
+        // Preserve the previous accounting interpretation until separately approved.
+        // This is explicitly unverified and cannot be exported as a shared report.
+        buildDashboardFromData(workers, logs.map((log) => ({ ...log, date: parseLogDate(log.timestamp) })));
+      }
     } catch (error) {
+      setSessionReport(null);
       setErrorMsg("No se pudo calcular el dashboard: " + error.message);
     } finally {
       setBusy(false);
@@ -1437,9 +1472,17 @@ function App() {
 
     setBusy(true);
     try {
-      const logs = await getSortedUserLogs(user.uid);
-      const latestFirst = [...logs].reverse();
-      setWorkerHistory(latestFirst);
+      const logsQuery = query(collection(db, "logs"),
+        where("companyId", "==", companyId), where("userId", "==", user.uid));
+      const snapshot = await getDocs(logsQuery);
+      const records = snapshot.docs.map((item) => ({ ...item.data(), id: item.id }));
+      const view = buildSessionView(records, { now: new Date() });
+      setWorkerHistory(view.history);
+      setWorkerSessionNotice(!view.compatible
+        ? "Hay fichajes que requieren revisión. Se conservan sus datos originales; las duraciones no confirmadas son desconocidas."
+        : view.unknownCount
+          ? `${view.unknownCount} jornadas pendientes con duración desconocida. Contacta con el administrador si olvidaste fichar salida.`
+          : "");
       setWorkerHistoryPage(1);
     } catch (error) {
       setErrorMsg("No se pudo cargar el historial: " + error.message);
@@ -1459,6 +1502,7 @@ function App() {
   };
 
   const buildReportRows = () => {
+    if (sessionReport?.ready) return sessionReport.summary;
     if (resumenTrabajadores.length > 0) return resumenTrabajadores;
     return trabajadores.map((item) => ({
       id: item.id,
@@ -1571,6 +1615,10 @@ function App() {
 
   const descargarPDFTrabajadores = async () => {
     clearMessages();
+    if (!sessionReportMatchesContext || !sessionReport?.ready || sessionReport.from !== dateFrom || sessionReport.to !== dateTo) {
+      setErrorMsg("Actualiza el filtro y revisa las incidencias antes de exportar.");
+      return;
+    }
 
     try {
       const rows = buildReportRows();
@@ -1583,7 +1631,7 @@ function App() {
       const docPdf = new jsPdfModule.jsPDF();
 
       const empresa = editEmpresa.name || "Empresa";
-      const fecha = new Date().toLocaleString();
+      const fecha = `${formatReportDate(new Date())} (Madrid)`;
       let y = 20;
 
       docPdf.setFontSize(14);
@@ -1594,6 +1642,12 @@ function App() {
       y += 6;
       docPdf.text(`Generado: ${fecha}`, 14, y);
       y += 12;
+      docPdf.setFontSize(8);
+      for (const line of docPdf.splitTextToSize(sessionReport.notice, 180)) {
+        docPdf.text(line, 14, y);
+        y += 4;
+      }
+      y += 4;
 
       docPdf.setFontSize(11);
       docPdf.text("Email", 14, y);
@@ -1612,6 +1666,11 @@ function App() {
         docPdf.text(minutesToHours(row.minutosMes), 124, y);
         docPdf.text(minutesToHours(row.minutosAcumulados), 172, y);
         y += 6;
+        if (row.unknownPeriod || row.unknownTotal) {
+          docPdf.setFontSize(8);
+          docPdf.text(`Duracion desconocida: ${row.unknownPeriod} en rango; ${row.unknownTotal} en historial.`, 14, y);
+          y += 5;
+        }
       });
 
       docPdf.save(`reporte_trabajadores_${Date.now()}.pdf`);
@@ -1624,6 +1683,10 @@ function App() {
 
   const descargarCSVTrabajadores = () => {
     clearMessages();
+    if (!sessionReportMatchesContext || !sessionReport?.ready || sessionReport.from !== dateFrom || sessionReport.to !== dateTo) {
+      setErrorMsg("Actualiza el filtro y revisa las incidencias antes de exportar.");
+      return;
+    }
     const rows = buildReportRows();
 
     if (rows.length === 0) {
@@ -1631,11 +1694,17 @@ function App() {
       return;
     }
 
-    const header = ["email", "horas_rango", "horas_totales"];
+    const header = ["email", "horas_rango", "horas_totales", "jornadas_desconocidas_rango",
+      "jornadas_desconocidas_historial", "avisos_historial", "zona_horaria", "criterio_fecha"];
     const body = rows.map((row) => [
       row.email || "",
       minutesToHours(row.minutosMes),
       minutesToHours(row.minutosAcumulados),
+      row.unknownPeriod,
+      row.unknownTotal,
+      sessionReport.view.issues.length,
+      "Europe/Madrid",
+      "reparto_dias_naturales",
     ]);
 
     const csvContent = [header, ...body]
@@ -1659,18 +1728,21 @@ function App() {
 
   const descargarCSVInspeccion = async () => {
     clearMessages();
+    if (!sessionReportMatchesContext || !sessionReport?.ready || sessionReport.from !== dateFrom || sessionReport.to !== dateTo) {
+      setErrorMsg("Actualiza el filtro y revisa las incidencias antes de exportar.");
+      return;
+    }
     setBusy(true);
 
     try {
-      const workers = trabajadores.length > 0 ? trabajadores : await cargarTrabajadores();
       const companySnap = await getDoc(doc(db, "companies", companyId));
       const companyData = companySnap.exists() ? companySnap.data() : editEmpresa;
-      const logsQuery = query(collection(db, "logs"), where("companyId", "==", companyId));
-      const logsSnap = await getDocs(logsQuery);
-      const logs = logsSnap.docs
-        .map((item) => ({ id: item.id, ...item.data(), date: parseLogDate(item.data().timestamp) }))
-        .filter((item) => item.date);
-      const rows = buildInspectionRows(workers, logs, companyData || {});
+      const rows = sessionReport.inspectionRows.map((row) => ({ ...row,
+        companyName: companyData?.name || "No disponible", companyCif: companyData?.cif || "No disponible",
+        companyAddress: companyData?.address || "No disponible", companyResponsible: companyData?.responsable || "No disponible",
+        workerName: getWorkerName(row.worker), workerEmail: row.worker.email || "No disponible", workerId: row.worker.id,
+        dateFrom: dateFrom || "inicio", dateTo: dateTo || "hoy", generatedAt: sessionReport.generatedAt,
+      }));
 
       if (rows.length === 0) {
         setErrorMsg("No hay datos para exportar.");
@@ -1696,6 +1768,9 @@ function App() {
         "entrada_log_id",
         "salida_log_id",
         "entrada_log_id_pairing",
+        "estado_sesion", "jornadas_desconocidas_rango", "jornadas_desconocidas_historial",
+        "avisos_historial", "zona_horaria", "criterio_fecha", "entrada_madrid", "salida_madrid",
+        "minutos_en_rango", "reparto_diario_madrid",
       ];
       const body = rows.map((row) => [
         row.companyName,
@@ -1716,6 +1791,9 @@ function App() {
         row.entradaLogId,
         row.salidaLogId,
         row.entradaLogIdPairing,
+        row.sessionStatus, row.unknownPeriod, row.unknownHistory, row.historyIssueCount,
+        row.timeZone, row.datePolicy, row.entradaMadrid, row.salidaMadrid,
+        row.periodMinutes, row.dailyAllocation,
       ]);
       const csvContent = [header, ...body]
         .map((line) => line.map(csvEscape).join(","))
@@ -1790,6 +1868,9 @@ function App() {
       ) : rol === "administrador" ? (
         <AdminPanel
           stats={stats}
+          sessionReportNotice={sessionReport && (!sessionReportMatchesContext || sessionReport.from !== dateFrom || sessionReport.to !== dateTo)
+            ? "Pulsa Aplicar filtro para actualizar los totales y habilitar las exportaciones." : sessionReport?.notice || ""}
+          sessionReportReady={Boolean(sessionReportMatchesContext && sessionReport?.ready && sessionReport.from === dateFrom && sessionReport.to === dateTo)}
           errorMsg={errorMsg}
           infoMsg={infoMsg}
           editEmpresa={editEmpresa}
@@ -1823,6 +1904,7 @@ function App() {
             cerrarSesion={cerrarSesion}
             busy={busy}
             workerHistory={pagedWorkerHistory}
+            workerSessionNotice={workerSessionNotice}
             workerHistoryPage={workerHistoryPage}
             totalHistoryPages={totalHistoryPages}
             onPrevHistoryPage={onPrevHistoryPage}
@@ -1834,7 +1916,7 @@ function App() {
         />
       </div>
     )}
-    </div>
+     </div>
   );
 }
 

@@ -1,0 +1,49 @@
+{
+  "functions": [
+    {
+      "source": "functions",
+      "codebase": "phase3-local",
+      "runtime": "nodejs22",
+      "ignore": [
+        "node_modules",
+        ".git",
+        "*-debug.log"
+      ],
+      "predeploy": [
+        "node scripts/block-phase3-deploy.mjs"
+      ]
+    }
+  ],
+  "firestore": {
+    "rules": "firestore.phase3-local.rules",
+    "predeploy": [
+      "node scripts/block-phase3-deploy.mjs"
+    ]
+  },
+  "emulators": {
+    "auth": {
+      "host": "127.0.0.1",
+      "port": 19099
+    },
+    "firestore": {
+      "host": "127.0.0.1",
+      "port": 18080
+    },
+    "functions": {
+      "host": "127.0.0.1",
+      "port": 15001
+    },
+    "hub": {
+      "host": "127.0.0.1",
+      "port": 14400
+    },
+    "logging": {
+      "host": "127.0.0.1",
+      "port": 14500
+    },
+    "ui": {
+      "enabled": false
+    },
+    "singleProjectMode": false
+  }
+}
