@@ -45,6 +45,47 @@ Orden: las 16 pruebas originales con reglas originales; las mismas 16 con reglas
 
 La matriz nueva verifica lecturas propias/empresa, rechazo entre empresas y anónimo/no verificado, consultas no restringidas, todas las escrituras internas para trabajador y administrador, creación directa entrada/salida en cada modo, controles inválidos, batch malicioso, cola offline de cliente antiguo al reconectar, tres callables en cada modo, recuperación sin nuevas escrituras y barrera de pausa. Los snapshots posteriores comparan datos y updateTime para detectar efectos inesperados.
 
+## Resultado de validación local — 13/11/2026
+
+Estado del paso 3.6: implementación validada y cierre documental en su alcance local de reglas y modos de escritura. Este resultado NO valida ni autoriza producción, despliegues, migraciones, activación de backend ni cambios en EMAR. No se inicia el paso 3.7.
+
+Base comprobada: rama `estabilizacion-fichad2`, commit `af5c3a26bb19dc91eab5a2f211d66949e72976c5`, con árbol de trabajo limpio al comenzar y terminar la validación. Se utilizó Node **22.23.3**, Firebase CLI **15.8.0** y Java **21.0.11**, ya disponibles, sin instalar dependencias ni modificar los archivos del proyecto.
+
+Comando del lanzador, ejecutado con Node 22: `node scripts/run-phase3-emulators.mjs test`. Resultado final: **545 pruebas aprobadas, 0 fallidas, 0 omitidas; código de salida 0**.
+
+| Bloque | Aprobadas | Fallidas | Omitidas |
+| --- | ---: | ---: | ---: |
+| Reglas originales | 16 | 0 | 0 |
+| Compatibilidad legacy con reglas alternativas | 16 | 0 | 0 |
+| Regresiones generales, dominio y entorno | 262 | 0 | 0 |
+| clockIn | 51 | 0 | 0 |
+| clockOut | 67 | 0 | 0 |
+| Regularización | 77 | 0 | 0 |
+| Matriz específica de reglas y modos del paso 3.6 | 56 | 0 | 0 |
+| **Total** | **545** | **0** | **0** |
+
+Las 33 pruebas de configuración y aislamiento pasaron también antes del arranque y se repitieron dentro del bloque de 262. No se suman de nuevo al total de 545. La batería incluye las 226 pruebas locales de reconstrucción, informes, integración y dominio previamente aprobadas.
+
+### Aislamiento e integridad comprobados
+
+- Único proyecto: `demo-fichad2-phase3`. Auth en `127.0.0.1:19099`, Firestore en `127.0.0.1:18080` y Functions en `127.0.0.1:15001`, con hub y logging locales y UI desactivada.
+- Configuración local validada, JAR existente de Firestore verificado contra la huella esperada por la CLI y credenciales ficticias explícitas. Las guardas rechazaron los casos comprobados de proyectos reales, hosts remotos y variables de credenciales.
+- Almacén de configuración de la CLI aislado, sin cuentas ni tokens y con telemetría desactivada. No se registraron llamadas API remotas de la CLI; no se utilizaron credenciales reales ni se consultaron servicios o datos de producción.
+- Los 64 archivos versionados conservaron sus hashes durante la validación. Los 13 archivos comprobados del snapshot de backend, paquetes y reglas coincidieron con sus originales.
+- Los snapshots, fixtures y logs de ejecución quedaron en carpetas temporales nuevas fuera del repositorio. El entorno principal fue `C:\Users\hugoembuena\AppData\Local\Temp\fichad2-step32-puiT3N`; sus artefactos son temporales y su permanencia no está garantizada.
+- El lanzador confirmó el cierre de sus puertos al finalizar. La comprobación posterior no encontró listeners en 19099, 18080, 15001, 14400, 14500 y 9150. Sin reparaciones, cambios de reglas publicadas, commits ni operaciones remotas Git.
+
+### Comportamientos confirmados
+
+La matriz de autoridad de este documento quedó comprobada mediante reglas alternativas y callables HTTP reales en los emuladores:
+
+- `legacy`: se permiten creaciones directas de logs sujetas a las validaciones históricas; las callables rechazan efectos nuevos con `SERVICE_PAUSED`. Los reintentos confirmados pueden recuperar su justificante sin nuevas escrituras.
+- `paused`: se rechazan tanto las creaciones directas como los efectos nuevos de las tres callables. La recuperación de justificantes confirmados no altera documentos ni fechas de commit. La barrera de pausa impide efectos nuevos posteriores, sin revertir commits anteriores.
+- `backend`: el cliente no puede crear logs directamente. `clockIn`, `clockOut` y `regularizeSession` solo generan efectos tras validar identidad, rol, empresa, control, protocolo, epoch, estado e historial cuando corresponde.
+- Control ausente: se conserva la compatibilidad legacy para escrituras directas; las callables rechazan la operación con `INVALID_CONTROL`. Un control existente inválido no se interpreta como ausencia y deniega efectos nuevos.
+- Administrador y trabajador: lecturas internas limitadas por identidad y empresa; escrituras internas de cliente prohibidas incluso para administradores. Se comprobaron rechazos entre empresas, anónimos, usuarios no verificados y consultas no restringidas.
+- Integridad: edición y borrado de logs originales denegados; regularizaciones sin alterar originales; concurrencia, rollback, idempotencia y recuperación sin escrituras adicionales comprobados. Las escrituras offline de clientes antiguos se rechazaron al reconectar tras el cambio de modo.
+
 ## Transición futura: no ejecutada
 
 1. Autorizar y ensayar por separado cliente compatible, inicialización y capa de informes con regularizaciones. No activar backend con el React actual: seguirá intentando escrituras directas y no interpreta regularizaciones.
@@ -59,8 +100,23 @@ No borrar el control tras el corte: la ausencia vuelve a permitir legacy. No vol
 
 ## Riesgos pendientes
 
+**Bloqueo para activar backend en una empresa real:** React sigue utilizando escrituras directas y todavía no consume las tres callables ni integra regularizaciones en historial, dashboard, PDF y CSV. Cambiar ahora a `backend` rechazaría sus fichajes directos. La validación local del paso 3.6 no elimina esta incompatibilidad ni autoriza modificar el modo de ninguna empresa real.
+
 Se ha probado emulación, no IAM, índices cloud, latencia o facturación. Las pruebas no certifican recursos desplegados. Admin SDK puede alterar datos si se usa fuera de estos servicios; el futuro acceso operativo debe quedar restringido por IAM y procedimientos. Una pausa se serializa con las transacciones que leen su control, pero no revierte una escritura anterior; siempre reconciliar antes de inicializar.
 
 En legacy permanecen las limitaciones anteriores: las reglas no prueban por sí mismas una única sesión ni la coherencia de entradaLogId con el original. No se amplía esa vía y no se mezcla con backend. Inicialización real, manejo de altas posteriores al corte, avisos React, informes efectivos y ensayo completo de transición requieren pasos y autorizaciones posteriores. No hay promesa de cero interrupciones para clientes antiguos.
 
+El Node 22 utilizado está en una carpeta temporal. Si deja de estar disponible, habrá que comprobar de nuevo el runtime antes de repetir la batería; este cierre no autoriza instalarlo ni actualizar dependencias automáticamente.
+
 Producción y EMAR no se consultan ni se modifican en este paso; no se verifican de nuevo datos reales. Las cifras históricas de EMAR son contexto de referencia, no fixtures copiados de producción ni una nueva auditoría real.
+
+## Condiciones para abordar el paso 3.7 — no iniciado
+
+1. Obtener autorización expresa para comenzar 3.7 y acordar su objetivo, archivos permitidos y criterios de aceptación. Este cierre no decide ni implementa automáticamente el siguiente trabajo.
+2. Comprobar el estado de Git y preservar el punto de partida recuperado, tomando este commit y la batería de 545 pruebas como referencia. Mantener íntegros los originales, las pruebas existentes y las salvaguardas de aislamiento.
+3. Conservar el alcance local: proyecto demo, destinos loopback, credenciales ficticias y runtime compatible. Preparar y probar cada cambio con datos inventados; no utilizar históricos reales como fixtures.
+4. Si el alcance autorizado incluye el cliente, especificar y probar callables, requestId estable, protocolo, epoch, versiones de estado, recuperación de confirmaciones y mensajes de pausa o actualización. No admitir éxito por datos pendientes o en caché ni retorno automático a escrituras directas ante un fallo del backend.
+5. Si incluye inicialización, comenzar por un planificador puro y pruebas ficticias de integridad, manifiesto/digest, idempotencia e incidencias. La ejecución sobre datos reales requiere otra autorización y no forma parte de la preparación local.
+6. Si incluye historial o informes con regularizaciones, comprobar referencias y lecturas consistentes, conservar registros originales, distinguir duraciones desconocidas de cero y mantener las salvaguardas del reparto diario. No simular salidas históricas inexistentes.
+7. Definir las pruebas nuevas del alcance aprobado y exigir que las regresiones existentes sigan pasando. Un ensayo local de transición debe cubrir pausa, solicitudes en vuelo, clientes antiguos/offline e incompatibilidades, sin activar ninguna empresa real.
+8. Mantener separada cualquier futura decisión cloud: IAM, índices, costes, Blaze, despliegues, migraciones y ventana de corte requieren revisión y autorización independientes. Ningún resultado local permite declarar producción validada.
