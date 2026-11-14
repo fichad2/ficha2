@@ -42,6 +42,137 @@ function diagnostic(code, source, recordIndexes = [], recordIds = [], blocking =
     recordIds: [...recordIds].sort(compare), blocking };
 }
 
+// Same logical, company-scoped identity used by the manifest inventory. No
+// ownership is inferred from arbitrary metadata or from an admin's signature.
+const documentPath = (source, document) => object(document) && id(document.id) ? source + "/" + document.id : null;
+function inspectDocumentIdentityConflicts(input) {
+  const documents = [], byPath = new Map(), dependents = new Map();
+  const receiptPath = (actor, requestId, companyId) => id(actor) && uuid(requestId) && companyId === input.companyId
+    ? "requests/" + createHash("sha256").update(JSON.stringify([DOMAIN_VERSION, companyId, actor, requestId])).digest("hex") : null;
+  for (const source of sources) for (const [index, document] of input[source].entries()) {
+    const path = documentPath(source, document);
+    if (path === null) continue; // Existing invalid/unattributed-data guards remain authoritative.
+    const node = { source, index, id: document.id, path, owners: new Set(), subjectRefs: new Set(), dependencies: new Set(), identityRefs: new Set(), mismatches: [] };
+    const data = ["profiles", "logs"].includes(source) ? document : object(document.data) ? document.data : {};
+    node.companyId = id(data.companyId) ? data.companyId : null;
+    const owner = uid => { if (id(uid)) node.owners.add(uid); };
+    const reference = (collection, key, subject = true) => {
+      if (!id(key)) return;
+      const target = collection + "/" + key;
+      if (target === path) return; // A matching self-identity is not another subject.
+      node.dependencies.add(target); if (subject) node.subjectRefs.add(target);
+    };
+    const requestDependency = (actor, requestId) => {
+      const target = receiptPath(actor, requestId, data.companyId);
+      if (target) node.dependencies.add(target);
+      return target;
+    };
+    if (source === "profiles") owner(document.id);
+    if (source === "logs") {
+      owner(data.userId);
+      if (data.tipo === "salida") reference("logs", data.entradaLogId);
+    }
+    if (source === "states") {
+      owner(document.id); owner(data.userId);
+      if (id(data.userId) && document.id !== data.userId) {
+        node.mismatches.push("data.userId"); node.identityRefs.add("states/" + data.userId);
+      }
+      reference("profiles", document.id, false);
+      reference("logs", data.activeEntryId);
+      if (object(data.lastResolution)) {
+        reference("logs", data.lastResolution.originalEntryId);
+        reference("regularizations", data.lastResolution.regularizationId);
+      }
+      // UUIDs are actor-scoped. An unrelated worker reusing an admin's UUID
+      // does not depend on that admin's receipt or its conflicting outcome.
+      requestDependency(data.status === SESSION_STATUS.REGULARIZED ? data.lastResolution?.adminUid : document.id, data.lastRequestId);
+    }
+    if (source === "regularizations") {
+      owner(data.workerUid);
+      reference("logs", document.id); reference("logs", data.originalEntryId);
+      reference("profiles", data.adminUid, false);
+      requestDependency(data.adminUid, data.requestId);
+      if (id(data.originalEntryId) && document.id !== data.originalEntryId) {
+        node.mismatches.push("data.originalEntryId"); node.identityRefs.add("regularizations/" + data.originalEntryId);
+      }
+    }
+    if (source === "requests") {
+      const ordinary = ["clockIn", "clockOut"].includes(data.operation), regularize = data.operation === "regularizeSession";
+      if (ordinary) {
+        owner(data.actorUid); owner(data.workerUid);
+        if (id(data.workerUid) && id(data.actorUid) && data.workerUid !== data.actorUid) node.mismatches.push("data.workerUid");
+      } else if (regularize) owner(data.workerUid);
+      reference("profiles", data.actorUid, false);
+      if (ordinary || regularize) {
+        reference("logs", data.result?.originalEntryId); reference("logs", data.result?.eventId);
+        if (regularize) reference("regularizations", data.result?.originalEntryId);
+      }
+      if (id(data.requestKey)) {
+        reference("requests", data.requestKey);
+        if (document.id !== data.requestKey) {
+          node.mismatches.push("data.requestKey"); node.identityRefs.add("requests/" + data.requestKey);
+        }
+      }
+      const expected = data.schemaVersion === DOMAIN_VERSION ? requestDependency(data.actorUid, data.requestId) : null;
+      if (expected && expected !== path) {
+        node.subjectRefs.add(expected);
+        node.identityRefs.add(expected);
+        node.mismatches.push("request_identity");
+      }
+    }
+    documents.push(node);
+    if (!byPath.has(path)) byPath.set(path, []);
+    byPath.get(path).push(node);
+    for (const dependency of node.dependencies) {
+      if (!dependents.has(dependency)) dependents.set(dependency, []);
+      dependents.get(dependency).push(node);
+    }
+  }
+  const ownersOf = node => {
+    const result = new Set(), visited = new Set(), pending = [node];
+    while (pending.length) {
+      const current = pending.pop(); if (visited.has(current)) continue;
+      visited.add(current); for (const uid of current.owners) result.add(uid);
+      for (const ref of current.subjectRefs) pending.push(...(byPath.get(ref) ?? []));
+    }
+    return result;
+  };
+  const conflicts = [];
+  const conflict = (code, path, nodes, fields = [], aliases = []) => {
+    const related = new Set(nodes), paths = new Set(), pending = [path, ...aliases];
+    while (pending.length) {
+      const current = pending.pop(); if (paths.has(current)) continue;
+      paths.add(current);
+      for (const node of byPath.get(current) ?? []) related.add(node);
+      for (const dependent of dependents.get(current) ?? []) {
+        related.add(dependent); pending.push(dependent.path);
+      }
+    }
+    const affected = new Set(), recovery = new Set(); let unattributed = false;
+    for (const node of related) {
+      const owners = ownersOf(node); if (!owners.size) unattributed = true;
+      for (const uid of owners) {
+        affected.add(uid);
+        if (["states", "regularizations", "requests"].includes(node.source)) recovery.add(uid);
+      }
+    }
+    const d = { ...diagnostic(code, nodes[0].source, nodes.map(node => node.index), [nodes[0].id]),
+      companyId: input.companyId, path, count: nodes.length,
+      declaredCompanyIds: [...new Set(nodes.map(node => node.companyId).filter(value => value !== null))].sort(compare),
+      affectedUserIds: [...affected].sort(compare), relatedPaths: [...paths].sort(compare), unattributed };
+    if (fields.length) d.fields = [...new Set(fields)].sort(compare);
+    conflicts.push({ diagnostic: d, recoveryUserIds: recovery });
+  };
+  for (const [path, nodes] of byPath) if (nodes.length > 1) conflict("duplicate_document_path", path, nodes);
+  for (const node of documents) {
+    // Only subject references participate in ownership checks; authorizers are
+    // dependencies, not owners of another person's employment session.
+    if ([...ownersOf(node)].some(uid => !node.owners.has(uid))) node.mismatches.push("subject_reference_scope");
+    if (node.mismatches.length) conflict("document_identity_mismatch", node.path, [node], node.mismatches, node.identityRefs);
+  }
+  return conflicts;
+}
+
 const uuid = value => typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
 const hexDigest = value => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
 const receiptResultFields = ["operation", "eventId", "originalEntryId", "stateVersion", "status", "minutes", "exitAt", "mode"];
@@ -253,6 +384,10 @@ function inspectExistingTrace(input, person, core, owned) {
  * Raw consecutive-entry issues may be explicitly accounted for by a unique,
  * verified accredited-resolution/next-entry receipt boundary. All other raw
  * blockers remain effective; neither logs nor reconstruction results change.
+ * Document identity conflicts reach their owners and dependent proofs. Scoped
+ * conflicts also appear in top-level diagnostics with affectedUserIds; they
+ * do not automatically attach to unrelated people. Unattributable data and
+ * foreign-company rows retain the existing whole-input fail-closed guards.
  *
  * The same DTOs and fixed evaluatedAt produce the same output. Diagnostic indexes
  * refer to the supplied array positions; no input record is reordered or changed.
@@ -265,10 +400,10 @@ export function planSessionReconciliation(input) {
     throw new TypeError("Expected explicit company, fixed timestamp, five completeness flags and dense source arrays.");
   }
   const complete = sources.every(source => input.complete[source]);
-  const people = new Map(), globalDiagnostics = [];
+  const people = new Map(), globalDiagnostics = [], documentDiagnostics = [];
   let globalBlocked = false, globalRecovery = false;
   const person = uid => {
-    if (!people.has(uid)) people.set(uid, { uid, profiles: [], states: [], artifacts: [], diagnostics: [] });
+    if (!people.has(uid)) people.set(uid, { uid, profiles: [], states: [], artifacts: [], diagnostics: [], documentRecovery: false });
     return people.get(uid);
   };
   const global = (code, source, index, recordId, recovery = false) => {
@@ -357,6 +492,28 @@ export function planSessionReconciliation(input) {
     globalDiagnostics.push(diagnostic("source_incomplete", source));
   }
 
+  for (const { diagnostic: d, recoveryUserIds } of inspectDocumentIdentityConflicts(input)) {
+    if (d.unattributed) {
+      globalDiagnostics.push(d); globalBlocked = true;
+      if (["states", "regularizations", "requests"].includes(d.source)) globalRecovery = true;
+    } else documentDiagnostics.push(d);
+    for (const uid of d.affectedUserIds) {
+      const p = person(uid); if (!d.unattributed) p.diagnostics.push(d);
+      p.documentRecovery ||= recoveryUserIds.has(uid);
+      // Preserve the prior backend-duplicate diagnostic contract as well.
+      if (d.code === "duplicate_document_path" && ["regularizations", "requests"].includes(d.source)) {
+        p.diagnostics.push(diagnostic("duplicate_backend_document", d.source, [], d.recordIds));
+      }
+      if (d.code === "duplicate_document_path" && d.source === "profiles") {
+        for (const artifact of p.artifacts.filter(a => a.source === "regularizations")) {
+          if (d.recordIds.includes(input.regularizations[artifact.index].data.adminUid)) {
+            p.diagnostics.push(diagnostic("regularization_trace_invalid", "regularizations", [artifact.index], [artifact.id]));
+          }
+        }
+      }
+    }
+  }
+
   const decisions = [...people.values()].sort((a, b) => compare(a.uid, b.uid)).map(p => {
     const diagnostics = [...p.diagnostics, ...globalDiagnostics];
     const backendLogs = input.logs.filter(log => log?.userId === p.uid && /^(entry|exit)_[0-9a-f]{64}$/.test(log.id));
@@ -396,7 +553,7 @@ export function planSessionReconciliation(input) {
     const deferredAdjacencies = new Set(p.states.length === 1
       ? diagnostics.filter(d => d.blocking && d.source === "logs" && d.code === "consecutive_entries") : []);
     if (globalBlocked || diagnostics.some(d => d.blocking && !deferredAdjacencies.has(d))) {
-      return result(p.states.length || p.artifacts.length || backendLogs.length
+      return result(p.states.length || p.artifacts.length || backendLogs.length || p.documentRecovery
         ? PLANNING_DECISION.RECOVERY_REQUIRED : PLANNING_DECISION.BLOCKED);
     }
     if (p.states.length) {
@@ -467,11 +624,11 @@ export function planSessionReconciliation(input) {
   });
   return { contractVersion: RECONCILIATION_CONTRACT_VERSION, companyId: input.companyId,
     evaluatedAt: { ...input.evaluatedAt }, sourceComplete: complete,
-    decisions, diagnostics: sorted(globalDiagnostics) };
+    decisions, diagnostics: sorted([...globalDiagnostics, ...documentDiagnostics]) };
 }
 
 export const RECONCILIATION_MANIFEST_SCHEMA = 1;
-export const RECONCILIATION_ALGORITHM = "fichad2-reconciliation/3.7.4-v2";
+export const RECONCILIATION_ALGORITHM = "fichad2-reconciliation/3.7.4-v3";
 
 /**
  * Versioned, typed canonical encoding, NOT ordinary JSON serialization.
@@ -586,7 +743,7 @@ export function buildReconciliationManifest(input, evidence = {}) {
       canonicalizeReconciliationValue(input[source]);
       const rows = input[source].map(document => {
         const documentId = object(document) && id(document.id) ? document.id : null;
-        return { document, documentId, path: documentId === null ? null : source + "/" + documentId,
+        return { document, documentId, path: documentPath(source, document),
           canonical: canonicalizeReconciliationValue(document) };
       }).sort((a, b) => compare(a.path ?? "", b.path ?? "") || compare(a.canonical, b.canonical));
       inventory[source] = { count: rows.length, documents: rows.map((row, canonicalIndex) => ({

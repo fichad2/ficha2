@@ -1368,3 +1368,274 @@ test("one accredited boundary cannot conceal another untraced open entry", () =>
   assert.equal(codes(decision).includes("consecutive_entries_accounted_for"), false);
   assert.equal(input.logs.length, 3);
 });
+
+// Global identity collision: each worker's trace is coherent in isolation, but
+// a shared admin request UUID claims two different outcomes at one receipt path.
+function sharedReceiptIdentityFixture(workers = ["fictional-owner-a", "fictional-owner-b"]) {
+  const admin = "fictional-shared-admin";
+  const input = fixture({ profiles: [{ ...profile(admin), role: "administrador" },
+    ...workers.map(uid => profile(uid)), profile("fictional-unaffected")], evaluatedAt: later(86402) });
+  for (const uid of workers) {
+    const original = { ...entry("fictional-original-" + uid, uid) };
+    const state = idle({ userId: uid, status: "open", activeEntryId: original.id, openedAt: start });
+    const decision = evaluateSessionOperation({ state, now: later(86401),
+      actor: { uid: admin, companyId, role: "administrador", emailVerified: true },
+      control: { companyId, writeMode: "backend", epoch: 1, minProtocolVersion: 1 },
+      request: { operation: "regularizeSession", requestId: "10000000-0000-4000-8000-000000000001",
+        companyContext: companyId, expectedStateVersion: 0, expectedEpoch: 1, protocolVersion: 1,
+        originalEntryId: original.id, mode: "unknown_exit", reason: "Fictional identity audit", evidenceReference: null, accreditedExitAt: null },
+      history: { complete: true, entry: original, exitIds: [], regularizationIds: [], nextEntryAt: null, conflicts: [] } });
+    assert.equal(decision.ok, true);
+    const { type, id: eventId, ...data } = decision.plan.event;
+    input.logs.push(original); input.regularizations.push({ id: eventId, data });
+    input.requests.push({ id: decision.plan.requestKey, data: { ...decision.plan.receipt, workerUid: uid } });
+    input.states.push({ id: uid, data: decision.plan.nextState });
+  }
+  input.states.push({ id: admin, data: idle({ userId: admin }) },
+    { id: "fictional-unaffected", data: idle({ userId: "fictional-unaffected" }) });
+  return input;
+}
+
+test("global receipt path collision reaches both evolved owners without blocking unrelated workers", () => {
+  const input = freeze(sharedReceiptIdentityFixture()), before = structuredClone(input), result = plan(input);
+  assert.equal(input.requests[0].id, input.requests[1].id);
+  for (const uid of ["fictional-owner-a", "fictional-owner-b"]) {
+    const decision = result.decisions.find(d => d.userId === uid);
+    assert.equal(decision.decision, "recovery_required"); assert.equal(decision.proposedState, null);
+  }
+  for (const uid of ["fictional-shared-admin", "fictional-unaffected"]) {
+    assert.equal(result.decisions.find(d => d.userId === uid).decision, "already_initialized");
+  }
+  assert.equal(makeManifest(input).applicable, false);
+  assert.deepEqual(input, before);
+});
+
+function assertDocumentConflict(input, affected, untouched = []) {
+  const before = structuredClone(input); freeze(input);
+  const planning = plan(input), manifest = makeManifest(input);
+  for (const uid of affected) {
+    const decision = planning.decisions.find(d => d.userId === uid);
+    assert.equal(decision.decision, "recovery_required", uid);
+    assert.equal(decision.proposedState, null); assert.equal(decision.proposedStatus, null);
+    assert.ok(decision.diagnostics.some(d => d.blocking && ["duplicate_document_path", "document_identity_mismatch"].includes(d.code)
+      && d.affectedUserIds.includes(uid)));
+  }
+  for (const [uid, expected] of untouched) {
+    const decision = planning.decisions.find(d => d.userId === uid);
+    assert.equal(decision.decision, expected, uid);
+    assert.equal(decision.diagnostics.some(d => ["duplicate_document_path", "document_identity_mismatch"].includes(d.code)), false);
+  }
+  assert.equal(manifest.applicable, false);
+  assert.ok(planning.diagnostics.some(d => d.blocking && ["duplicate_document_path", "document_identity_mismatch"].includes(d.code)));
+  assert.deepEqual(input, before);
+  return { planning, manifest };
+}
+
+for (const uid of ["fictional-owner-a", "fictional-owner-b"]) test("one coherent owner has no collision by itself: " + uid, () => {
+  const input = freeze(sharedReceiptIdentityFixture([uid]));
+  assert.equal(plan(input).decisions.find(d => d.userId === uid).decision, "already_initialized");
+  assert.equal(makeManifest(input).applicable, true);
+});
+
+test("global duplicate receipt diagnostics name every owner, path and original occurrence", () => {
+  const input = sharedReceiptIdentityFixture();
+  assert.notEqual(canonical(input.requests[0]), canonical(input.requests[1]));
+  const { planning, manifest } = assertDocumentConflict(input, ["fictional-owner-a", "fictional-owner-b"],
+    [["fictional-shared-admin", "already_initialized"], ["fictional-unaffected", "already_initialized"]]);
+  const conflict = planning.diagnostics.find(d => d.code === "duplicate_document_path" && d.source === "requests");
+  assert.deepEqual(conflict.affectedUserIds, ["fictional-owner-a", "fictional-owner-b"]);
+  assert.equal(conflict.companyId, companyId); assert.equal(conflict.path, "requests/" + input.requests[0].id);
+  assert.deepEqual(conflict.recordIndexes, [0, 1]); assert.equal(conflict.count, 2);
+  assert.ok(conflict.relatedPaths.includes("states/fictional-owner-a"));
+  assert.ok(conflict.relatedPaths.includes("states/fictional-owner-b"));
+  assert.equal(manifest.inventory.requests.count, 2); assert.equal(manifest.inventory.requests.documents.length, 2);
+  assert.ok(manifest.diagnostics.some(d => d.code === "duplicate_document_path"));
+});
+
+for (const source of manifestSources) test("same-worker duplicate " + source + " blocks its owner and preserves unrelated decisions", () => {
+  const input = backendFixture(["clockIn", "regularizeSession"], "accredited_exit");
+  input[source].push(structuredClone(input[source][0]));
+  const { planning, manifest } = assertDocumentConflict(input, [userId], [["fictional-admin", "eligible"]]);
+  assert.ok(codes(planning.decisions.find(d => d.userId === userId)).includes("duplicate_document_path"));
+  assert.equal(manifest.inventory[source].count, input[source].length);
+});
+
+for (const conflicting of [false, true]) test("same-owner duplicate receipt is not deduplicated: changed payload=" + conflicting, () => {
+  const input = backendFixture(["clockIn"]), duplicate = structuredClone(input.requests[0]);
+  if (conflicting) duplicate.data.result.stateVersion = 9;
+  input.requests.push(duplicate);
+  const { manifest } = assertDocumentConflict(input, [userId], [["fictional-admin", "eligible"]]);
+  assert.equal(manifest.inventory.requests.documents.length, 2);
+  assert.equal(manifest.inventory.requests.documents[0].digest === manifest.inventory.requests.documents[1].digest, !conflicting);
+});
+
+test("affected backend owner without an operational state requires recovery, never initialization", () => {
+  const input = sharedReceiptIdentityFixture();
+  input.states = input.states.filter(s => s.id !== "fictional-owner-a");
+  assertDocumentConflict(input, ["fictional-owner-a", "fictional-owner-b"], [["fictional-unaffected", "already_initialized"]]);
+});
+
+for (const existing of [false, true]) test("duplicate profile uses the blocking decision appropriate to existing state=" + existing, () => {
+  const input = fixture({ profiles: [profile(), profile(), profile("fictional-other")],
+    states: existing ? [{ id: userId, data: idle() }] : [] });
+  const before = structuredClone(input), output = plan(freeze(input));
+  const affected = output.decisions.find(d => d.userId === userId);
+  assert.equal(affected.decision, existing ? "recovery_required" : "blocked");
+  assert.equal(affected.proposedState, null);
+  assert.equal(output.decisions.find(d => d.userId === "fictional-other").decision, "eligible");
+  assert.equal(makeManifest(input).applicable, false); assert.deepEqual(input, before);
+});
+
+test("initial existing state with conflicting body identity reaches both claimed owners", () => {
+  const a = "fictional-state-a", b = "fictional-state-b", c = "fictional-state-c";
+  const input = fixture({ profiles: [profile(a), profile(b), profile(c)],
+    states: [a, b, c].map(uid => ({ id: uid, data: idle({ userId: uid }) })) });
+  input.states[0].data.userId = b;
+  const { planning } = assertDocumentConflict(input, [a, b], [[c, "already_initialized"]]);
+  assert.ok(planning.diagnostics.some(d => d.code === "document_identity_mismatch" && d.fields.includes("data.userId")));
+});
+
+function ordinaryIdentityFixture() {
+  const input = simulationInput(companyId), a = simulationWorker(input, "identity-a"), b = simulationWorker(input, "identity-b");
+  simulationBackend(input, a, ["clockIn"]); simulationBackend(input, b, ["clockIn"]);
+  simulationWorker(input, "unrelated"); simulationState(input, companyId + "-unrelated");
+  return { input, a, b, untouched: companyId + "-unrelated" };
+}
+
+test("receipt wrapper/key alias marks both document owners, not just the malformed row", () => {
+  const { input, a, b, untouched } = ordinaryIdentityFixture();
+  input.requests[1].data.requestKey = input.requests[0].id;
+  const { planning } = assertDocumentConflict(input, [a, b], [[untouched, "already_initialized"]]);
+  const conflict = planning.diagnostics.find(d => d.code === "document_identity_mismatch" && d.fields.includes("data.requestKey"));
+  assert.ok(conflict.relatedPaths.includes("requests/" + input.requests[0].id));
+  assert.deepEqual(conflict.affectedUserIds, [a, b].sort());
+});
+
+test("ordinary receipt with two conflicting subject identities reaches both workers", () => {
+  const { input, a, b, untouched } = ordinaryIdentityFixture(); input.requests[0].data.workerUid = b;
+  const { planning } = assertDocumentConflict(input, [a, b], [[untouched, "already_initialized"]]);
+  assert.ok(planning.diagnostics.some(d => d.code === "document_identity_mismatch" && d.fields.includes("data.workerUid")));
+});
+
+test("cross-worker original references preserve explicit identity diagnostics for both sides", () => {
+  const { input, a, b, untouched } = ordinaryIdentityFixture();
+  input.requests[0].data.result.originalEntryId = input.logs[1].id;
+  const { planning } = assertDocumentConflict(input, [a, b], [[untouched, "already_initialized"]]);
+  assert.ok(planning.diagnostics.some(d => d.code === "document_identity_mismatch" && d.fields.includes("subject_reference_scope")));
+});
+
+test("duplicated authorizer profile invalidates dependent proofs without treating signatures as session ownership", () => {
+  const input = sharedReceiptIdentityFixture(["fictional-owner-a"]);
+  input.profiles.push(structuredClone(input.profiles.find(p => p.id === "fictional-shared-admin")));
+  assertDocumentConflict(input, ["fictional-owner-a", "fictional-shared-admin"], [["fictional-unaffected", "already_initialized"]]);
+});
+
+test("a different actor reusing the same raw UUID does not depend on the shared admin receipt", () => {
+  const input = sharedReceiptIdentityFixture(), uid = simulationWorker(input, "independent-actor");
+  simulationBackend(input, uid, ["clockIn"]);
+  assert.equal(input.requests[0].data.requestId, input.requests[2].data.requestId);
+  assert.notEqual(input.requests[0].id, input.requests[2].id);
+  assertDocumentConflict(input, ["fictional-owner-a", "fictional-owner-b"], [[uid, "already_initialized"],
+    ["fictional-shared-admin", "already_initialized"], ["fictional-unaffected", "already_initialized"]]);
+});
+
+test("unknown backend ownership keeps the existing whole-input fail-closed guard", () => {
+  const input = sharedReceiptIdentityFixture(["fictional-owner-a"]), duplicate = structuredClone(input.requests[0]);
+  delete duplicate.data.workerUid; input.requests.push(duplicate);
+  const before = structuredClone(input), result = plan(freeze(input));
+  assert.ok(result.decisions.every(d => d.decision === "recovery_required" && d.proposedState === null));
+  assert.ok(result.diagnostics.some(d => d.code === "unattributed_backend_artifact"));
+  assert.equal(makeManifest(input).applicable, false); assert.deepEqual(input, before);
+});
+
+test("logical document paths are scoped by the company input and do not collide across independent companies", () => {
+  const inputs = simulationCompanies.map(company => {
+    const input = simulationInput(company); input.profiles.push({ id: "fictional-same-id", companyId: company, role: "trabajador" });
+    simulationState(input, "fictional-same-id"); return freeze(input);
+  });
+  const manifests = inputs.map(makeManifest);
+  assert.ok(manifests.every(m => m.applicable));
+  assert.ok(manifests.every(m => m.planning.decisions[0].decision === "already_initialized"));
+  assert.equal(manifests[0].inventory.states.documents[0].path, manifests[1].inventory.states.documents[0].path);
+  assert.notEqual(manifests[0].planDigest, manifests[1].planDigest);
+  assert.deepEqual([...inputs].reverse().map(makeManifest).reverse(), manifests);
+});
+
+test("foreign-company duplicates are not silently filtered or allowed to validate a mixed snapshot", () => {
+  const company = simulationCompanies[0], foreign = simulationCompanies[1], input = simulationInput(company);
+  const uid = simulationWorker(input, "mixed-company"); simulationState(input, uid);
+  const other = simulationWorker(input, "otherwise-valid"); simulationState(input, other);
+  input.states.push({ id: uid, data: idle({ companyId: foreign, userId: uid }) });
+  const before = structuredClone(input), result = plan(freeze(input));
+  assert.ok(result.decisions.every(d => d.decision === "recovery_required" && d.proposedState === null));
+  assert.ok(result.diagnostics.some(d => d.code === "company_scope_mismatch"));
+  assert.equal(makeManifest(input).applicable, false); assert.deepEqual(input, before);
+});
+
+test("duplicate diagnostics, decisions and digests are deterministic under every source reordering", () => {
+  const input = freeze(sharedReceiptIdentityFixture()), before = structuredClone(input), expected = makeManifest(input);
+  for (let i = 0; i < 12; i++) {
+    const changed = structuredClone(input);
+    for (const [index, source] of manifestSources.entries()) {
+      if ((i + index) % 2) changed[source].reverse();
+      if (changed[source].length > 1) changed[source].push(...changed[source].splice(0, i % changed[source].length));
+    }
+    assert.equal(JSON.stringify(makeManifest(changed)), JSON.stringify(expected));
+  }
+  assert.deepEqual(makeManifest(input), expected); assert.deepEqual(input, before);
+  expected.planning.diagnostics[0].affectedUserIds.length = 0;
+  assert.deepEqual(input, before);
+  assert.ok(makeManifest(input).planning.diagnostics.some(d => d.affectedUserIds?.length === 2));
+});
+
+for (const source of manifestSources) test("observed identity conflicts never certify a partial " + source + " source", () => {
+  const input = sharedReceiptIdentityFixture(); input.complete[source] = false;
+  const output = plan(freeze(input));
+  assert.ok(output.decisions.every(d => d.decision === "incomplete_source" && d.proposedState === null));
+  assert.equal(makeManifest(input).applicable, false);
+});
+
+test("equal request UUID and payload fingerprint across distinct actors are not a path collision", () => {
+  const { input, a, b, untouched } = ordinaryIdentityFixture();
+  assert.equal(input.requests[0].data.requestId, input.requests[1].data.requestId);
+  assert.equal(input.requests[0].data.payloadFingerprint, input.requests[1].data.payloadFingerprint);
+  assert.notEqual(input.requests[0].id, input.requests[1].id);
+  const before = structuredClone(input), result = plan(freeze(input));
+  for (const uid of [a, b, untouched]) assert.equal(result.decisions.find(d => d.userId === uid).decision, "already_initialized");
+  assert.equal(result.diagnostics.some(d => ["duplicate_document_path", "document_identity_mismatch"].includes(d.code)), false);
+  assert.equal(makeManifest(input).applicable, true); assert.deepEqual(input, before);
+});
+
+test("receipt identity derived from actor/company/UUID cannot silently alias another outcome", () => {
+  const { input, a, b, untouched } = ordinaryIdentityFixture();
+  input.requests[1].data.actorUid = a;
+  const { planning } = assertDocumentConflict(input, [a, b], [[untouched, "already_initialized"]]);
+  assert.ok(planning.diagnostics.some(d => d.code === "document_identity_mismatch" && d.fields.includes("request_identity")));
+});
+
+test("cyclic receipt identity aliases terminate and remain deterministic without changing originals", () => {
+  const { input, a, b, untouched } = ordinaryIdentityFixture();
+  [input.requests[0].data.requestKey, input.requests[1].data.requestKey] = [input.requests[1].id, input.requests[0].id];
+  const { manifest } = assertDocumentConflict(input, [a, b], [[untouched, "already_initialized"]]);
+  const reordered = structuredClone(input);
+  for (const source of manifestSources) reordered[source].reverse();
+  assert.deepEqual(makeManifest(reordered), manifest);
+});
+
+test("a state body claiming a worker without an owned state requires recovery rather than a fresh proposal", () => {
+  const a = "fictional-state-owner", b = "fictional-claimed-owner", c = "fictional-independent-owner";
+  const input = fixture({ profiles: [profile(a), profile(b), profile(c)],
+    states: [{ id: a, data: idle({ userId: b }) }, { id: c, data: idle({ userId: c }) }] });
+  assertDocumentConflict(input, [a, b], [[c, "already_initialized"]]);
+});
+
+test("unrelated accredited reentry still validates beside a global receipt collision", () => {
+  const input = sharedReceiptIdentityFixture(), uid = simulationWorker(input, "accredited-independent");
+  simulationBackend(input, uid, ["clockIn", "regularizeSession", "clockIn"], "accredited_exit");
+  input.evaluatedAt = { ...simulationTime };
+  const { planning } = assertDocumentConflict(input, ["fictional-owner-a", "fictional-owner-b"], [[uid, "already_initialized"],
+    ["fictional-shared-admin", "already_initialized"], ["fictional-unaffected", "already_initialized"]]);
+  const coherent = planning.decisions.find(d => d.userId === uid);
+  assert.equal(coherent.proposedState, null);
+  assert.ok(coherent.diagnostics.some(d => d.code === "consecutive_entries_accounted_for" && !d.blocking));
+});
