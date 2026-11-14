@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { reconstructSessions } from "../../src/session-reconstruction.js";
 import { DOMAIN_VERSION, inspectSessionState, SESSION_STATUS } from "./session-domain.js";
 
@@ -251,4 +252,163 @@ export function planSessionReconciliation(input) {
   return { contractVersion: RECONCILIATION_CONTRACT_VERSION, companyId: input.companyId,
     evaluatedAt: { ...input.evaluatedAt }, sourceComplete: complete,
     decisions, diagnostics: sorted(globalDiagnostics) };
+}
+
+export const RECONCILIATION_MANIFEST_SCHEMA = 1;
+export const RECONCILIATION_ALGORITHM = "fichad2-reconciliation/3.7.3-v1";
+
+/**
+ * Versioned, typed canonical encoding, NOT ordinary JSON serialization.
+ * Object key order is irrelevant; array order is significant. No toJSON/getter
+ * is invoked. Dates retain their type and exact milliseconds; timestamp DTOs
+ * retain their original fields/nanoseconds. Null, missing, -0 and scalar types
+ * cannot alias. Unsupported values fail closed rather than being dropped.
+ */
+export function canonicalizeReconciliationValue(value) {
+  const ancestors = new Set();
+  const reject = () => { throw new TypeError("Non-representable reconciliation value"); };
+  const encode = v => {
+    if (v === null) return ["null"];
+    if (typeof v === "string" || typeof v === "boolean") return [typeof v, v];
+    if (typeof v === "number") {
+      if (!Number.isFinite(v)) return reject();
+      return ["number", Object.is(v, -0) ? "-0" : String(v)];
+    }
+    // Explicit depth bound makes oversized nested DTOs fail with a diagnostic,
+    // rather than relying on an engine-dependent stack overflow threshold.
+    if (typeof v !== "object" || ancestors.has(v) || ancestors.size >= 256) return reject();
+    ancestors.add(v);
+    try {
+      const keys = Reflect.ownKeys(v);
+      if (Object.getPrototypeOf(v) === Date.prototype) {
+        const ms = Date.prototype.getTime.call(v);
+        if (keys.length || !Number.isFinite(ms)) return reject();
+        return ["date", String(ms)];
+      }
+      if (keys.some(key => typeof key !== "string")) return reject();
+      const descriptors = Object.getOwnPropertyDescriptors(v);
+      if (Array.isArray(v)) {
+        if (Object.getPrototypeOf(v) !== Array.prototype || keys.length !== v.length + 1) return reject();
+        const values = [];
+        for (let i = 0; i < v.length; i++) {
+          const d = descriptors[String(i)];
+          if (!d || !d.enumerable || !Object.hasOwn(d, "value")) return reject();
+          values.push(encode(d.value));
+        }
+        return ["array", values];
+      }
+      if (!object(v)) return reject();
+      return [Object.getPrototypeOf(v) === null ? "null_prototype_object" : "object",
+        keys.sort(compare).map(key => {
+          const d = descriptors[key];
+          if (!d.enumerable || !Object.hasOwn(d, "value")) return reject();
+          return [key, encode(d.value)];
+        })];
+    } finally { ancestors.delete(v); }
+  };
+  return JSON.stringify(encode(value));
+}
+
+const canonicalDigest = value => createHash("sha256")
+  .update(RECONCILIATION_ALGORITHM + "\n" + canonicalizeReconciliationValue(value), "utf8").digest("hex");
+
+/**
+ * Pure manifest API; the original planner API keeps its arrival-index contract.
+ * input has precisely the planner contract. evidence is a five-source map of
+ * {kind: "caller_declaration", reference: nonempty string, complete: boolean}.
+ * These are caller assertions, never proof of an atomic or exhaustive snapshot.
+ * Missing/mismatched evidence blocks local applicability. No SDK or I/O occurs.
+ *
+ * Paths below are logical source/id paths, NOT inferred Firestore locations.
+ * Repeated paths are retained, counted and blocked, even for identical data.
+ * Canonical indexes in planning diagnostics refer to the sorted inventory.
+ * planDigest covers the entire manifest except itself, including evidence and
+ * all diagnostics. If a value cannot be represented, digests for that source
+ * and the whole plan are null: no hash is claimed for a lossy substitute.
+ * applicable only means eligible for subsequent LOCAL review; it grants no
+ * write/production authorization, concurrency guarantee or provenance proof.
+ * Only trusted in-memory DTOs are supported; hostile Proxies are out of scope.
+ */
+export function buildReconciliationManifest(input, evidence = {}) {
+  // Inspect the envelope without evaluating accessor properties.
+  const fields = ["companyId", "evaluatedAt", "complete", ...sources];
+  const envelope = Object.getOwnPropertyDescriptors(input ?? {});
+  if (!object(input) || !exactKeys(input, fields)
+    || fields.some(key => !Object.hasOwn(envelope[key], "value"))) {
+    throw new TypeError("Expected the explicit planner input envelope with data properties");
+  }
+  // Header must be fully representable before reading its properties.
+  canonicalizeReconciliationValue([input.companyId, input.evaluatedAt, input.complete]);
+  if (!id(input.companyId) || !timestamp(input.evaluatedAt) || !exactKeys(input.complete, sources)
+    || !sources.every(source => typeof input.complete[source] === "boolean" && Array.isArray(input[source]))) {
+    throw new TypeError("Invalid manifest header or source collections");
+  }
+  const diagnostics = [], inventory = {}, sourceDigests = {}, ordered = {};
+  const completeness = {};
+  let representable = true;
+  let evidenceRepresentable = true;
+  try { canonicalizeReconciliationValue(evidence); }
+  catch { evidenceRepresentable = false; representable = false; }
+  const evidenceMapValid = evidenceRepresentable && object(evidence)
+    && Reflect.ownKeys(evidence).every(key => sources.includes(key));
+  if (!evidenceMapValid) diagnostics.push({ code: "invalid_completeness_evidence", source: "evidence", blocking: true });
+  for (const source of sources) {
+    // Detached canonical text protects the declaration without embedding mutable
+    // references or copying confidential document payloads into this manifest.
+    const declaration = evidenceMapValid && Object.hasOwn(evidence, source) ? evidence[source] : null;
+    const validEvidence = exactKeys(declaration, ["kind", "reference", "complete"])
+      && declaration.kind === "caller_declaration" && typeof declaration.reference === "string"
+      && declaration.reference.trim().length > 0 && declaration.complete === input.complete[source];
+    completeness[source] = { declaredComplete: input.complete[source],
+      evidence: declaration === null ? null : canonicalizeReconciliationValue(declaration),
+      evidenceValid: validEvidence };
+    if (!validEvidence) diagnostics.push({ code: "completeness_evidence_missing_or_mismatched", source, blocking: true });
+    if (!input.complete[source]) diagnostics.push({ code: "source_incomplete", source, blocking: true });
+    try {
+      // Validate whole collection first (including holes/extra properties), then
+      // sort by logical ID/path and the entire typed payload as a tie-breaker.
+      canonicalizeReconciliationValue(input[source]);
+      const rows = input[source].map(document => {
+        const documentId = object(document) && id(document.id) ? document.id : null;
+        return { document, documentId, path: documentId === null ? null : source + "/" + documentId,
+          canonical: canonicalizeReconciliationValue(document) };
+      }).sort((a, b) => compare(a.path ?? "", b.path ?? "") || compare(a.canonical, b.canonical));
+      inventory[source] = { count: rows.length, documents: rows.map((row, canonicalIndex) => ({
+        canonicalIndex, id: row.documentId, path: row.path, digest: canonicalDigest(row.document),
+      })) };
+      const paths = new Map();
+      for (const row of rows) {
+        if (row.path === null) continue;
+        paths.set(row.path, (paths.get(row.path) ?? 0) + 1);
+      }
+      for (const [path, count] of paths) if (count > 1) {
+        diagnostics.push({ code: "duplicate_document_path", source, path, count, blocking: true });
+      }
+      ordered[source] = rows.map(row => row.document);
+      sourceDigests[source] = canonicalDigest({ source, documents: ordered[source] });
+    } catch (error) {
+      if (!(error instanceof TypeError)) throw error;
+      representable = false;
+      sourceDigests[source] = null;
+      inventory[source] = { count: input[source].length, documents: null };
+      diagnostics.push({ code: "non_representable_source", source, blocking: true });
+    }
+  }
+  const evaluatedAt = { seconds: input.evaluatedAt.seconds, nanoseconds: input.evaluatedAt.nanoseconds };
+  const planning = representable ? planSessionReconciliation({
+    companyId: input.companyId, evaluatedAt, complete: input.complete, ...ordered,
+  }) : null;
+  const applicable = representable && diagnostics.length === 0
+    && !planning.diagnostics.some(d => d.blocking)
+    && planning.decisions.every(d => [PLANNING_DECISION.ELIGIBLE, PLANNING_DECISION.ALREADY_INITIALIZED].includes(d.decision));
+  const manifest = {
+    schemaVersion: RECONCILIATION_MANIFEST_SCHEMA, algorithmVersion: RECONCILIATION_ALGORITHM,
+    plannerContractVersion: RECONCILIATION_CONTRACT_VERSION, domainSchemaVersion: DOMAIN_VERSION,
+    companyId: input.companyId, evaluatedAt,
+    scope: "in_memory_review_only", productionAuthorized: false,
+    completenessEvidence: evidenceRepresentable ? canonicalizeReconciliationValue(evidence) : null,
+    completeness, sourceDigests, inventory, planning,
+    diagnostics: sorted(diagnostics), applicable,
+  };
+  return { ...manifest, planDigest: representable ? canonicalDigest(manifest) : null };
 }

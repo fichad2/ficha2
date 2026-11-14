@@ -3,6 +3,9 @@ import { test } from "node:test";
 import { planSessionReconciliation as plan, PLANNING_DECISION } from "../../functions/src/session-reconciliation-plan.js";
 import { DOMAIN_VERSION, inspectSessionState } from "../../functions/src/session-domain.js";
 import { buildSessionView } from "../../src/session-reporting.js";
+import { createHash } from "node:crypto";
+import { buildReconciliationManifest as manifest, canonicalizeReconciliationValue as canonical,
+  RECONCILIATION_ALGORITHM } from "../../functions/src/session-reconciliation-plan.js";
 
 // Invented data only. No SDK, credentials, network, emulator or fixture writes.
 const companyId = "fictional-company";
@@ -381,4 +384,271 @@ test("3.7.2 new state proposals use only the explicit evaluation instant", () =>
     Math.random = () => { throw Error("randomness forbidden"); };
     assertInitialState(input, { status: "open", activeEntryId: "fictional-entry", openedAt: start });
   } finally { Date.now = dateNow; Math.random = random; }
+});
+
+// 3.7.3: original 101 cases above are retained; all data below is fictitious.
+const manifestSources = ["profiles", "logs", "states", "regularizations", "requests"];
+const declaration = input => Object.fromEntries(manifestSources.map(source => [source,
+  { kind: "caller_declaration", reference: "fictional-snapshot/" + source, complete: input.complete[source] }]));
+const makeManifest = input => manifest(input, declaration(input));
+const digestPattern = /^[a-f0-9]{64}$/;
+
+test("3.7.3 complete manifest binds proposals, inventory, declarations and versions", () => {
+  const input = freeze(fixture({ logs: [entry()] }));
+  const result = makeManifest(input);
+  assert.equal(result.schemaVersion, 1); assert.equal(result.algorithmVersion, RECONCILIATION_ALGORITHM);
+  assert.equal(result.domainSchemaVersion, DOMAIN_VERSION); assert.equal(result.plannerContractVersion, 1);
+  assert.equal(result.companyId, companyId); assert.deepEqual(result.evaluatedAt, input.evaluatedAt);
+  assert.equal(result.applicable, true); assert.equal(result.productionAuthorized, false);
+  assert.equal(result.scope, "in_memory_review_only"); assert.match(result.planDigest, digestPattern);
+  for (const source of manifestSources) {
+    assert.match(result.sourceDigests[source], digestPattern);
+    assert.equal(result.inventory[source].count, input[source].length);
+    assert.equal(result.completeness[source].declaredComplete, true);
+    assert.equal(result.completeness[source].evidenceValid, true);
+  }
+  assert.equal(result.inventory.logs.documents[0].path, "logs/fictional-entry");
+  assert.equal(result.planning.decisions[0].proposedState.activeEntryId, "fictional-entry");
+  const { planDigest, ...body } = result;
+  assert.equal(planDigest, createHash("sha256").update(RECONCILIATION_ALGORITHM + "\n" + canonical(body)).digest("hex"));
+});
+
+function permutationFixture() {
+  const other = "fictional-colleague";
+  return fixture({ profiles: [profile(other), profile()],
+    logs: [entry(), exit({ minutosSesion: 59 }), entry("colleague-entry", other)],
+    states: [{ id: userId, data: idle() }, { id: other, data: idle() }],
+    regularizations: [userId, other].map(uid => ({ id: uid + "-resolution", data: { companyId, workerUid: uid } })),
+    requests: [userId, other].map(uid => ({ id: uid + "-receipt", data: { companyId, actorUid: uid, operation: "clockIn" } })) });
+}
+test("3.7.3 permutations of every source yield byte-identical manifests including diagnostic indexes", () => {
+  const input = permutationFixture(), expected = makeManifest(freeze(structuredClone(input)));
+  for (const source of manifestSources) {
+    const reversed = structuredClone(input); reversed[source].reverse();
+    assert.equal(JSON.stringify(makeManifest(reversed)), JSON.stringify(expected));
+  }
+  const all = structuredClone(input); for (const source of manifestSources) all[source].reverse();
+  assert.deepEqual(makeManifest(all), expected);
+  assert.equal(expected.applicable, false);
+  assert.ok(expected.planning.decisions.some(d => d.decision === "recovery_required"));
+});
+
+for (const source of manifestSources) test("3.7.3 any field change in " + source + " changes source/global digest", () => {
+  const input = permutationFixture(), original = makeManifest(input), changed = structuredClone(input);
+  changed[source][0].previouslyUnknownField = { fictional: "changed", flags: [true, null, 5] };
+  const result = makeManifest(changed);
+  assert.notEqual(result.sourceDigests[source], original.sourceDigests[source]);
+  assert.notEqual(result.planDigest, original.planDigest);
+  for (const other of manifestSources.filter(s => s !== source)) assert.equal(result.sourceDigests[other], original.sourceDigests[other]);
+});
+
+for (const source of manifestSources) test("3.7.3 repeated identifiers in " + source + " are retained and block applicability", () => {
+  const input = permutationFixture(); input[source].push(structuredClone(input[source][0]));
+  const result = makeManifest(input), reversed = structuredClone(input); reversed[source].reverse();
+  assert.equal(result.inventory[source].count, input[source].length);
+  assert.equal(result.inventory[source].documents.length, input[source].length);
+  assert.ok(result.diagnostics.some(d => d.code === "duplicate_document_path" && d.source === source));
+  assert.equal(result.applicable, false); assert.deepEqual(makeManifest(reversed), result);
+  const withoutDuplicate = structuredClone(input); withoutDuplicate[source].pop();
+  assert.notEqual(result.sourceDigests[source], makeManifest(withoutDuplicate).sourceDigests[source]);
+});
+
+test("3.7.3 conflicting duplicate payloads use canonical content as a stable tie-breaker", () => {
+  const input = fixture({ logs: [entry(), { ...entry(), timestamp: later(1) }] });
+  const result = makeManifest(input); input.logs.reverse();
+  assert.deepEqual(makeManifest(input), result); assert.equal(result.applicable, false);
+  assert.notEqual(result.inventory.logs.documents[0].digest, result.inventory.logs.documents[1].digest);
+});
+
+test("3.7.3 canonical object property ordering does not depend on insertion order", () => {
+  assert.equal(canonical({ z: [null, { b: 2, a: 1 }], a: true }), canonical({ a: true, z: [null, { a: 1, b: 2 }] }));
+  const a = fixture({ logs: [entry()] }), b = structuredClone(a);
+  b.logs[0] = Object.fromEntries(Object.entries(b.logs[0]).reverse());
+  assert.deepEqual(makeManifest(a), makeManifest(b));
+});
+
+test("3.7.3 scalar types, absence, null, Date, timestamp DTO and negative zero never alias", () => {
+  const values = [{}, { x: null }, { x: 0 }, { x: -0 }, { x: "0" }, { x: false },
+    { x: [] }, { x: {} }, { x: new Date(0) }, { x: at(0) }];
+  assert.equal(new Set(values.map(canonical)).size, values.length);
+  const digests = values.map(extra => makeManifest(fixture({ logs: [{ ...entry(), extra }] })).planDigest);
+  assert.equal(new Set(digests).size, values.length);
+});
+
+test("3.7.3 array order is significant at every nesting depth", () => {
+  const a = fixture({ logs: [{ ...entry(), extra: { list: [1, "x", null] } }] });
+  const b = structuredClone(a); b.logs[0].extra.list.reverse();
+  assert.notEqual(makeManifest(a).sourceDigests.logs, makeManifest(b).sourceDigests.logs);
+  assert.notEqual(makeManifest(a).planDigest, makeManifest(b).planDigest);
+});
+
+test("3.7.3 one original nanosecond changes both source and plan digests", () => {
+  const a = fixture({ logs: [entry()] }), b = structuredClone(a);
+  b.logs[0].timestamp.nanoseconds++;
+  assert.notEqual(makeManifest(a).sourceDigests.logs, makeManifest(b).sourceDigests.logs);
+  assert.notEqual(makeManifest(a).planDigest, makeManifest(b).planDigest);
+  assert.equal(makeManifest(b).planning.decisions[0].proposedState.openedAt.nanoseconds, start.nanoseconds + 1);
+});
+
+test("3.7.3 explicit evaluation instant affects global digest but not source digests", () => {
+  const a = fixture(), b = structuredClone(a); b.evaluatedAt.nanoseconds++;
+  assert.deepEqual(makeManifest(a).sourceDigests, makeManifest(b).sourceDigests);
+  assert.notEqual(makeManifest(a).planDigest, makeManifest(b).planDigest);
+});
+
+for (const source of manifestSources) test("3.7.3 incomplete " + source + " changes digest and blocks the plan", () => {
+  const input = fixture(), before = makeManifest(input); input.complete[source] = false;
+  const result = makeManifest(input);
+  assert.equal(result.applicable, false); assert.notEqual(result.planDigest, before.planDigest);
+  assert.ok(result.diagnostics.some(d => d.code === "source_incomplete" && d.source === source));
+  assert.equal(result.planning.decisions[0].decision, "incomplete_source");
+  assert.equal(result.planning.decisions[0].proposedState, null);
+});
+
+test("3.7.3 absence of evidence cannot certify a complete source", () => {
+  const result = manifest(fixture());
+  assert.equal(result.applicable, false); assert.match(result.planDigest, digestPattern);
+  assert.equal(result.diagnostics.filter(d => d.code === "completeness_evidence_missing_or_mismatched").length, 5);
+});
+
+test("3.7.3 evidence reference and mismatched declaration affect the global digest", () => {
+  const input = fixture(), evidence = declaration(input), initial = manifest(input, evidence);
+  evidence.logs.reference = "fictional-snapshot/revised";
+  const changed = manifest(input, evidence); assert.notEqual(changed.planDigest, initial.planDigest);
+  evidence.logs.complete = false;
+  assert.equal(manifest(input, evidence).applicable, false);
+});
+
+for (const [name, value] of [["undefined", undefined], ["NaN", NaN], ["infinity", Infinity],
+  ["bigint", 1n], ["function", () => 1], ["symbol", Symbol("fictional")],
+  ["invalid date", new Date(NaN)], ["map", new Map()], ["set", new Set()],
+  ["typed array", new Uint8Array([1])], ["sparse array", Array(1)]]) {
+  test("3.7.3 unsupported " + name + " is diagnosed without claiming a digest or applicability", () => {
+    const input = fixture({ logs: [{ ...entry(), extra: value }] });
+    const result = makeManifest(input);
+    assert.equal(result.applicable, false); assert.equal(result.sourceDigests.logs, null);
+    assert.equal(result.planDigest, null); assert.equal(result.planning, null);
+    assert.ok(result.diagnostics.some(d => d.code === "non_representable_source" && d.source === "logs"));
+    assert.equal(result.inventory.logs.count, 1);
+  });
+}
+
+test("3.7.3 accessors, hidden properties, symbol keys and cycles are not read or discarded", () => {
+  let reads = 0;
+  const getter = {}; Object.defineProperty(getter, "value", { enumerable: true, get() { reads++; throw Error("must not run"); } });
+  const hidden = {}; Object.defineProperty(hidden, "value", { value: 3 });
+  const symbolic = { [Symbol("fictional")]: 3 };
+  const cycle = {}; cycle.self = cycle;
+  for (const extra of [getter, hidden, symbolic, cycle]) {
+    const result = makeManifest(fixture({ logs: [{ ...entry(), extra }] }));
+    assert.equal(result.planDigest, null); assert.equal(result.applicable, false);
+  }
+  assert.equal(reads, 0);
+});
+
+test("3.7.3 no toJSON invocation or unsupported custom prototype coercion", () => {
+  let calls = 0;
+  const extra = { toJSON() { calls++; return null; } };
+  assert.equal(makeManifest(fixture({ logs: [{ ...entry(), extra }] })).planDigest, null);
+  assert.equal(calls, 0);
+  assert.throws(() => canonical(Object.create({ inherited: 7 })), TypeError);
+});
+
+test("3.7.3 extra array properties and decorated Dates cannot be silently discarded", () => {
+  const arr = [1]; arr.extra = true;
+  const date = new Date(0); date.extra = true;
+  for (const extra of [arr, date]) assert.equal(makeManifest(fixture({ logs: [{ ...entry(), extra }] })).planDigest, null);
+});
+
+test("3.7.3 repeated shared references are values, not cycles, and preserve input immutability", () => {
+  const shared = { fictional: [null, 1, true] };
+  const input = freeze(fixture({ logs: [{ ...entry(), extra: { a: shared, b: shared } }] }));
+  const evidence = freeze(declaration(input)), before = structuredClone(input);
+  const first = manifest(input, evidence);
+  for (let i = 0; i < 5; i++) assert.equal(JSON.stringify(manifest(input, evidence)), JSON.stringify(first));
+  assert.deepEqual(input, before);
+  first.evaluatedAt.seconds = 0; first.planning.decisions[0].proposedState.openedAt.seconds = 0;
+  first.inventory.logs.documents[0].id = "mutated-output";
+  assert.deepEqual(input, before); assert.equal(manifest(input, evidence).applicable, true);
+});
+
+test("3.7.3 invalid identifiers retain documents and source digests while blocking planning", () => {
+  const input = fixture({ logs: [entry("invalid/path"), entry("invalid/path")] });
+  const result = makeManifest(input);
+  assert.equal(result.inventory.logs.count, 2); assert.match(result.sourceDigests.logs, digestPattern);
+  assert.equal(result.inventory.logs.documents[0].path, null); assert.equal(result.applicable, false);
+});
+
+test("3.7.3 unsupported evidence fails closed without executing accessors", () => {
+  const evidence = declaration(fixture());
+  Object.defineProperty(evidence.logs, "reference", { enumerable: true, get() { throw Error("forbidden"); } });
+  const result = manifest(fixture(), evidence);
+  assert.equal(result.applicable, false); assert.equal(result.planDigest, null);
+  assert.ok(result.diagnostics.some(d => d.code === "invalid_completeness_evidence"));
+});
+
+test("3.7.3 manifest hashing never consults clock or randomness", () => {
+  const input = fixture(), evidence = declaration(input), now = Date.now, random = Math.random;
+  try {
+    Date.now = () => { throw Error("forbidden"); }; Math.random = () => { throw Error("forbidden"); };
+    assert.match(manifest(input, evidence).planDigest, digestPattern);
+  } finally { Date.now = now; Math.random = random; }
+});
+
+test("3.7.3 fixed encoding vectors make the typed wire format explicit", () => {
+  assert.equal(canonical(null), '["null"]');
+  assert.equal(canonical(-0), '["number","-0"]');
+  assert.equal(canonical(new Date(-1)), '["date","-1"]');
+  assert.equal(canonical({ seconds: 7, nanoseconds: 123456789 }),
+    '["object",[["nanoseconds",["number","123456789"]],["seconds",["number","7"]]]]');
+});
+
+test("3.7.3 header and evidence object key order do not change serialized manifests", () => {
+  const input = fixture({ logs: [entry()] }), original = makeManifest(input);
+  input.evaluatedAt = { nanoseconds: input.evaluatedAt.nanoseconds, seconds: input.evaluatedAt.seconds };
+  input.complete = Object.fromEntries(Object.entries(input.complete).reverse());
+  const evidence = Object.fromEntries(Object.entries(declaration(input)).reverse()
+    .map(([source, row]) => [source, Object.fromEntries(Object.entries(row).reverse())]));
+  assert.equal(JSON.stringify(manifest(input, evidence)), JSON.stringify(original));
+});
+
+for (const source of manifestSources) test("3.7.3 unrepresentable data in " + source + " blocks the entire manifest", () => {
+  const input = permutationFixture(); input[source][0].unsupported = undefined;
+  const result = makeManifest(input);
+  assert.equal(result.sourceDigests[source], null); assert.equal(result.planDigest, null);
+  assert.equal(result.planning, null); assert.equal(result.applicable, false);
+  assert.equal(result.inventory[source].count, input[source].length);
+});
+
+test("3.7.3 excessive nesting is diagnosed deterministically without overflow", () => {
+  let extra = null; for (let i = 0; i < 260; i++) extra = { nested: extra };
+  const input = fixture({ logs: [{ ...entry(), extra }] });
+  const result = makeManifest(input);
+  assert.equal(result.planDigest, null);
+  assert.ok(result.diagnostics.some(d => d.code === "non_representable_source"));
+});
+
+test("3.7.3 identical identifiers in different sources have distinct logical paths", () => {
+  const input = fixture({ logs: [entry(userId)] });
+  const result = makeManifest(input);
+  assert.equal(result.inventory.profiles.documents[0].path, "profiles/" + userId);
+  assert.equal(result.inventory.logs.documents[0].path, "logs/" + userId);
+  assert.equal(result.applicable, true);
+  assert.equal(result.diagnostics.some(d => d.code === "duplicate_document_path"), false);
+});
+
+test("3.7.3 a non-data envelope is rejected without evaluating its getter", () => {
+  const input = fixture();
+  Object.defineProperty(input, "logs", { enumerable: true, get() { throw Error("must not execute"); } });
+  assert.throws(() => makeManifest(input), TypeError);
+});
+
+test("3.7.3 invalid but representable evidence remains fully bound instead of being discarded", () => {
+  const input = fixture(), evidence = declaration(input);
+  evidence.unexpectedSource = { fictional: 1 };
+  const first = manifest(input, evidence);
+  assert.equal(first.applicable, false);
+  assert.equal(first.completenessEvidence, canonical(evidence));
+  evidence.unexpectedSource.fictional = 2;
+  assert.notEqual(manifest(input, evidence).planDigest, first.planDigest);
 });
