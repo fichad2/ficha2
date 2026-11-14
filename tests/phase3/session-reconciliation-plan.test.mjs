@@ -882,3 +882,288 @@ test("3.7.4 domain backend logs without state or receipts cannot be reinitialize
   assert.ok(codes(decision).includes("backend_event_without_state"));
   assert.equal(makeManifest(input).applicable, false);
 });
+
+// 3.7.5: integral simulations. Two independent company-scoped memory snapshots;
+// never an adapter, database, applicator or concurrency mechanism.
+const simulationCompanies = ["fictional-simulation-alpha", "fictional-simulation-beta"];
+const simulationTime = at(start.seconds + 200000, 123456789);
+function simulationInput(company) {
+  return { companyId: company, evaluatedAt: { ...simulationTime },
+    complete: Object.fromEntries(manifestSources.map(source => [source, true])),
+    profiles: [], logs: [], states: [], regularizations: [], requests: [] };
+}
+function simulationWorker(input, name, role = "trabajador") {
+  const uid = input.companyId + "-" + name;
+  input.profiles.push({ id: uid, companyId: input.companyId, role });
+  return uid;
+}
+function simulationEntry(input, uid, age = 3600, suffix = "entry") {
+  const record = { id: uid + "-" + suffix, companyId: input.companyId, userId: uid,
+    tipo: "entrada", timestamp: at(simulationTime.seconds - age, simulationTime.nanoseconds) };
+  input.logs.push(record); return record;
+}
+function simulationExit(input, anchor, seconds = 1800) {
+  const record = { id: anchor.id + "-exit", companyId: input.companyId, userId: anchor.userId,
+    tipo: "salida", timestamp: at(anchor.timestamp.seconds + seconds, anchor.timestamp.nanoseconds),
+    entradaLogId: anchor.id, inicioSesion: { ...anchor.timestamp }, minutosSesion: Math.floor(seconds / 60) };
+  input.logs.push(record); return record;
+}
+function simulationState(input, uid, extra = {}) {
+  input.states.push({ id: uid, data: idle({ companyId: input.companyId, userId: uid, ...extra }) });
+}
+function simulationBackend(input, uid, operations, mode = "unknown_exit") {
+  const adminUid = simulationWorker(input, uid.split(input.companyId + "-")[1] + "-admin", "administrador");
+  let state = idle({ companyId: input.companyId, userId: uid });
+  let time = at(simulationTime.seconds - 150000, simulationTime.nanoseconds);
+  for (const [index, operation] of operations.entries()) {
+    const isReg = operation === "regularizeSession";
+    time = at(time.seconds + (isReg ? 86401 : 3600), time.nanoseconds);
+    const request = { operation, requestId: "10000000-0000-4000-8000-" + String(index + 1).padStart(12, "0"),
+      companyContext: input.companyId, expectedStateVersion: state.version, expectedEpoch: 1, protocolVersion: 1 };
+    if (isReg) Object.assign(request, { originalEntryId: state.activeEntryId, mode,
+      reason: "Fictional integral simulation", evidenceReference: mode === "unknown_exit" ? null : "fictional-integral-evidence",
+      accreditedExitAt: mode === "unknown_exit" ? null : at(state.openedAt.seconds + 1800, state.openedAt.nanoseconds) });
+    const outcome = evaluateSessionOperation({ request, state, now: time,
+      actor: { uid: isReg ? adminUid : uid, companyId: input.companyId,
+        role: isReg ? "administrador" : "trabajador", emailVerified: true },
+      control: { companyId: input.companyId, writeMode: "backend", epoch: 1, minProtocolVersion: 1 },
+      history: { complete: true, entry: input.logs.find(log => log.id === state.activeEntryId),
+        exitIds: [], regularizationIds: [], nextEntryAt: null, conflicts: [] } });
+    assert.equal(outcome.ok, true, JSON.stringify(outcome));
+    const { type, id: eventId, ...event } = outcome.plan.event;
+    if (isReg) input.regularizations.push({ id: eventId, data: event });
+    else input.logs.push({ id: eventId, ...event });
+    input.requests.push({ id: outcome.plan.requestKey, data: { ...outcome.plan.receipt, workerUid: uid } });
+    state = outcome.plan.nextState;
+  }
+  simulationState(input, uid, state);
+}
+
+const simulationScenarios = [
+  { name: "empty", decision: "eligible", status: "idle", setup() {} },
+  { name: "closed", decision: "eligible", status: "idle", setup(input, uid) { simulationExit(input, simulationEntry(input, uid)); } },
+  { name: "recent-open", decision: "eligible", status: "open", setup(input, uid) { simulationEntry(input, uid); } },
+  { name: "overdue-open", decision: "eligible", status: "needs_review", setup(input, uid) { simulationEntry(input, uid, 86401); } },
+  { name: "multiple-open", decision: "blocked", code: "consecutive_entries", setup(input, uid) {
+    simulationEntry(input, uid); simulationEntry(input, uid, 1800, "second-entry");
+  } },
+  { name: "orphan-exit", decision: "blocked", code: "entry_not_found", setup(input, uid) {
+    simulationExit(input, { id: uid + "-absent", userId: uid, timestamp: at(simulationTime.seconds - 3600, simulationTime.nanoseconds) });
+  } },
+  { name: "duplicate", decision: "blocked", code: "duplicate_id", setup(input, uid) {
+    const record = simulationEntry(input, uid); input.logs.push(structuredClone(record));
+  } },
+  { name: "missing-profile", decision: "blocked", code: "profile_missing", setup(input, uid) {
+    input.profiles = input.profiles.filter(p => p.id !== uid); simulationEntry(input, uid);
+  } },
+  { name: "invalid-profile", decision: "blocked", code: "invalid_profile_role", setup(input, uid) {
+    input.profiles.find(p => p.id === uid).role = "fictional-invalid-role";
+  } },
+  { name: "existing-idle", decision: "already_initialized", setup(input, uid) { simulationState(input, uid); } },
+  { name: "evolved", decision: "already_initialized", setup(input, uid) { simulationBackend(input, uid, ["clockIn", "clockOut"]); } },
+  { name: "missing-trace", decision: "recovery_required", code: "backend_version_trace_incomplete", setup(input, uid) { simulationState(input, uid, { version: 7 }); } },
+  { name: "valid-regularization", decision: "already_initialized", setup(input, uid) { simulationBackend(input, uid, ["clockIn", "regularizeSession"]); } },
+  { name: "contradictory-regularization", decision: "recovery_required", code: "regularization_trace_invalid", setup(input, uid) {
+    simulationBackend(input, uid, ["clockIn", "regularizeSession"]);
+    input.regularizations.find(r => r.data.workerUid === uid).data.effectiveMinutes = 9;
+  } },
+  { name: "orphan-receipt", decision: "recovery_required", code: "backend_history_without_state", setup(input, uid) {
+    simulationBackend(input, uid, ["clockIn"]);
+    input.states = input.states.filter(s => s.id !== uid); input.logs = input.logs.filter(l => l.userId !== uid);
+  } },
+  { name: "administrator-clock", role: "administrador", decision: "eligible", status: "open", setup(input, uid) { simulationEntry(input, uid); } },
+];
+
+function assertSimulation(input) {
+  const originals = structuredClone(input), encoded = canonical(input);
+  freeze(input);
+  const result = makeManifest(input);
+  assert.deepEqual(input, originals); assert.equal(canonical(input), encoded);
+  assert.match(result.planDigest, digestPattern);
+  for (const d of result.planning.decisions) {
+    if (d.decision === "eligible") {
+      assert.equal(input.states.some(s => s.id === d.userId), false);
+      const checked = inspectSessionState(d.proposedState, input.evaluatedAt);
+      assert.equal(checked.ok, true); assert.deepEqual(checked.state, d.proposedState);
+      assert.equal(d.proposedState.version, 0);
+      assert.equal(d.proposedState.lastResolution, null); assert.equal(d.proposedState.lastRequestId, null);
+      assert.equal(Object.hasOwn(d.proposedState, "minutes"), false);
+      if (d.proposedState.activeEntryId !== null) {
+        const original = input.logs.find(log => log.id === d.proposedState.activeEntryId);
+        assert.equal(original.tipo, "entrada"); assert.equal(original.userId, d.userId);
+        assert.deepEqual(d.proposedState.openedAt, original.timestamp);
+      }
+    } else {
+      assert.equal(d.proposedState, null); assert.equal(d.proposedStatus, null);
+      if (["blocked", "recovery_required", "incomplete_source"].includes(d.decision)) {
+        assert.ok(d.diagnostics.some(diagnostic => diagnostic.blocking));
+        assert.equal(result.applicable, false);
+      }
+    }
+  }
+  const serialized = JSON.stringify(result);
+  for (let iteration = 0; iteration < 3; iteration++) {
+    assert.equal(JSON.stringify(makeManifest(input)), serialized);
+    const permuted = structuredClone(input);
+    for (const source of manifestSources) {
+      const list = permuted[source];
+      if (iteration === 0) list.reverse();
+      else if (list.length > 1) list.push(...list.splice(0, Math.min(iteration, list.length - 1)));
+    }
+    assert.equal(JSON.stringify(makeManifest(permuted)), serialized);
+  }
+  assert.deepEqual(input, originals);
+  return result;
+}
+
+for (const company of simulationCompanies) for (const scenario of simulationScenarios) {
+  test("3.7.5 integral " + company + ": " + scenario.name, () => {
+    const input = simulationInput(company), uid = simulationWorker(input, scenario.name, scenario.role);
+    scenario.setup(input, uid);
+    const result = assertSimulation(input), decision = result.planning.decisions.find(d => d.userId === uid);
+    assert.equal(decision.decision, scenario.decision);
+    if (scenario.status) assert.equal(decision.proposedState.status, scenario.status);
+    if (scenario.code) assert.ok(codes(decision).includes(scenario.code), JSON.stringify(decision.diagnostics));
+  });
+}
+
+function combinedSimulation(company) {
+  const input = simulationInput(company);
+  for (const scenario of simulationScenarios) {
+    const uid = simulationWorker(input, scenario.name, scenario.role); scenario.setup(input, uid);
+  }
+  return input;
+}
+for (const company of simulationCompanies) test("3.7.5 combined valid and ambiguous workers in " + company, () => {
+  const input = combinedSimulation(company), result = assertSimulation(input);
+  for (const scenario of simulationScenarios) {
+    const decision = result.planning.decisions.find(d => d.userId === company + "-" + scenario.name);
+    assert.equal(decision.decision, scenario.decision, scenario.name);
+  }
+  assert.equal(result.applicable, false);
+  assert.equal(result.planning.decisions.filter(d => d.proposedState !== null
+    && simulationScenarios.some(s => d.userId === company + "-" + s.name)).length, 5);
+});
+
+test("3.7.5 cross-company references block the contaminated snapshot and leave the other company unchanged", () => {
+  const a = simulationInput(simulationCompanies[0]), b = simulationInput(simulationCompanies[1]);
+  const aUid = simulationWorker(a, "cross-reference"), bUid = simulationWorker(b, "independent");
+  const bEntry = simulationEntry(b, bUid), originalB = assertSimulation(b);
+  a.logs.push(structuredClone(bEntry)); // Explicit erroneous foreign row, never silently filtered.
+  simulationExit(a, { ...bEntry, userId: aUid });
+  const resultA = assertSimulation(a);
+  assert.equal(resultA.applicable, false);
+  assert.ok(resultA.planning.diagnostics.some(d => d.code === "company_scope_mismatch"));
+  assert.equal(JSON.stringify(makeManifest(b)), JSON.stringify(originalB));
+  assert.equal(originalB.applicable, true);
+});
+
+test("3.7.5 incidents and document changes in one company cannot alter the independent company's manifest", () => {
+  const a = combinedSimulation(simulationCompanies[0]), b = combinedSimulation(simulationCompanies[1]);
+  const bManifest = assertSimulation(b), aManifest = assertSimulation(a);
+  const nextA = structuredClone(a); nextA.logs[0].fictionalEvidence = "changed-in-memory-only";
+  const changed = assertSimulation(nextA);
+  assert.notEqual(changed.planDigest, aManifest.planDigest);
+  assert.notEqual(changed.sourceDigests.logs, aManifest.sourceDigests.logs);
+  assert.equal(JSON.stringify(makeManifest(b)), JSON.stringify(bManifest));
+});
+
+for (const company of simulationCompanies) for (const source of manifestSources) {
+  test("3.7.5 combined incomplete " + source + " cannot be applicable for " + company, () => {
+    const input = combinedSimulation(company); input.complete[source] = false;
+    const result = assertSimulation(input);
+    assert.equal(result.applicable, false);
+    assert.ok(result.planning.decisions.every(d => d.decision === "incomplete_source"));
+    assert.ok(result.diagnostics.some(d => d.code === "source_incomplete" && d.source === source));
+  });
+}
+
+for (const source of manifestSources) test("3.7.5 new in-memory " + source + " snapshot invalidates the old integrated digest", () => {
+  const input = combinedSimulation(simulationCompanies[0]), original = assertSimulation(input);
+  const next = structuredClone(input);
+  next[source][0].fictionalRevision = { marker: "new-snapshot", values: [null, false, 1] };
+  const revised = assertSimulation(next);
+  assert.notEqual(revised.sourceDigests[source], original.sourceDigests[source]);
+  assert.notEqual(revised.planDigest, original.planDigest);
+  for (const other of manifestSources.filter(s => s !== source)) assert.equal(revised.sourceDigests[other], original.sourceDigests[other]);
+  assert.deepEqual(makeManifest(input), original);
+});
+
+for (const company of simulationCompanies) test("3.7.5 one nanosecond at 24 hours changes both classification and digest for " + company, () => {
+  const input = simulationInput(company), uid = simulationWorker(input, "temporal-boundary");
+  simulationEntry(input, uid, 86400);
+  const exact = assertSimulation(input);
+  assert.equal(exact.planning.decisions[0].proposedState.status, "open");
+  const after = structuredClone(input); after.evaluatedAt.nanoseconds++;
+  const overdue = assertSimulation(after);
+  assert.equal(overdue.planning.decisions[0].proposedState.status, "needs_review");
+  assert.equal(overdue.planning.decisions[0].proposedState.reviewReason, "overdue");
+  assert.deepEqual(overdue.sourceDigests, exact.sourceDigests);
+  assert.notEqual(overdue.planDigest, exact.planDigest);
+  const changedSource = structuredClone(input); changedSource.logs[0].timestamp.nanoseconds--;
+  const changed = assertSimulation(changedSource);
+  assert.notEqual(changed.sourceDigests.logs, exact.sourceDigests.logs);
+  assert.equal(changed.planning.decisions[0].proposedState.status, "needs_review");
+});
+
+test("3.7.5 multi-worker cross-references block both affected workers but preserve a third worker's proposal", () => {
+  const input = simulationInput(simulationCompanies[0]);
+  const a = simulationWorker(input, "first"), b = simulationWorker(input, "second"), c = simulationWorker(input, "unaffected");
+  const anchor = simulationEntry(input, a);
+  simulationEntry(input, a, 1800, "second-entry");
+  simulationExit(input, { ...anchor, userId: b });
+  const result = assertSimulation(input), byUid = new Map(result.planning.decisions.map(d => [d.userId, d]));
+  for (const uid of [a, b]) {
+    assert.equal(byUid.get(uid).decision, "blocked");
+    assert.ok(codes(byUid.get(uid)).includes("reference_scope_mismatch"));
+  }
+  assert.equal(byUid.get(c).decision, "eligible"); assert.equal(byUid.get(c).proposedState.status, "idle");
+});
+
+for (const company of simulationCompanies) test("3.7.5 known regularization retains only original logs and an accredited duration for " + company, () => {
+  const input = simulationInput(company), uid = simulationWorker(input, "accredited");
+  simulationBackend(input, uid, ["clockIn", "regularizeSession"], "accredited_exit");
+  const result = assertSimulation(input);
+  assert.equal(result.planning.decisions.find(d => d.userId === uid).decision, "already_initialized");
+  assert.equal(input.logs.length, 1); assert.equal(input.logs[0].tipo, "entrada");
+  assert.equal(input.regularizations[0].data.effectiveMinutes, 30);
+  assert.equal(result.planning.decisions.find(d => d.userId === uid).proposedState, null);
+});
+
+test("3.7.5 later snapshot can add a fictitious worker and entry without changing the earlier snapshot", () => {
+  const input = simulationInput(simulationCompanies[0]), firstUid = simulationWorker(input, "original-worker");
+  const first = assertSimulation(input), laterInput = structuredClone(input);
+  const newUid = simulationWorker(laterInput, "later-worker"); simulationEntry(laterInput, newUid);
+  const laterManifest = assertSimulation(laterInput);
+  assert.equal(first.planning.decisions.length, 1); assert.equal(laterManifest.planning.decisions.length, 2);
+  assert.equal(laterManifest.planning.decisions.find(d => d.userId === newUid).proposedState.status, "open");
+  assert.equal(laterManifest.planning.decisions.find(d => d.userId === firstUid).proposedState.status, "idle");
+  assert.notEqual(laterManifest.sourceDigests.profiles, first.sourceDigests.profiles);
+  assert.notEqual(laterManifest.sourceDigests.logs, first.sourceDigests.logs);
+  assert.notEqual(laterManifest.planDigest, first.planDigest);
+  assert.deepEqual(makeManifest(input), first);
+});
+
+test("3.7.5 processing the two companies in either order gives identical independent results", () => {
+  const snapshots = simulationCompanies.map(company => freeze(combinedSimulation(company)));
+  const forward = snapshots.map(makeManifest), reverse = [...snapshots].reverse().map(makeManifest).reverse();
+  assert.deepEqual(forward, reverse);
+  assert.notEqual(forward[0].planDigest, forward[1].planDigest);
+  for (const [index, result] of forward.entries()) {
+    assert.equal(result.companyId, snapshots[index].companyId);
+    assert.ok(result.planning.decisions.every(d => d.userId.startsWith(result.companyId + "-")));
+  }
+});
+
+test("3.7.5 complete healthy company remains applicable beside a different company with multiple incidents", () => {
+  const healthy = simulationInput(simulationCompanies[1]);
+  for (const name of ["empty", "closed", "recent-open", "overdue-open", "administrator-clock", "existing-idle", "evolved", "valid-regularization"]) {
+    const scenario = simulationScenarios.find(s => s.name === name);
+    const uid = simulationWorker(healthy, scenario.name, scenario.role); scenario.setup(healthy, uid);
+  }
+  const healthyBefore = assertSimulation(healthy);
+  assert.equal(healthyBefore.applicable, true);
+  const incidentResult = assertSimulation(combinedSimulation(simulationCompanies[0]));
+  assert.equal(incidentResult.applicable, false);
+  assert.deepEqual(makeManifest(healthy), healthyBefore);
+});
