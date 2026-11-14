@@ -3,6 +3,7 @@ import { test } from "node:test";
 import { planSessionReconciliation as plan, PLANNING_DECISION } from "../../functions/src/session-reconciliation-plan.js";
 import { DOMAIN_VERSION, inspectSessionState, evaluateSessionOperation } from "../../functions/src/session-domain.js";
 import { buildSessionView } from "../../src/session-reporting.js";
+import { reconstructSessions } from "../../src/session-reconstruction.js";
 import { createHash } from "node:crypto";
 import { buildReconciliationManifest as manifest, canonicalizeReconciliationValue as canonical,
   RECONCILIATION_ALGORITHM } from "../../functions/src/session-reconciliation-plan.js";
@@ -1166,4 +1167,204 @@ test("3.7.5 complete healthy company remains applicable beside a different compa
   const incidentResult = assertSimulation(combinedSimulation(simulationCompanies[0]));
   assert.equal(incidentResult.applicable, false);
   assert.deepEqual(makeManifest(healthy), healthyBefore);
+});
+
+test("accredited resolution permits a traced new entry without changing originals", () => {
+  const input = freeze(backendFixture(["clockIn", "regularizeSession", "clockIn"], "accredited_exit"));
+  const raw = reconstructSessions(input.logs, { now: input.evaluatedAt });
+  assert.ok(raw.issues.some(issue => issue.code === "consecutive_entries" && issue.blocking));
+  const decision = assertPreserved(input, "already_initialized", "evolved");
+  assert.equal(decision.proposedState, null);
+  assert.equal(input.logs.length, 2);
+  assert.ok(input.logs.every(log => log.tipo === "entrada"));
+  const accounted = decision.diagnostics.filter(issue => issue.code === "consecutive_entries_accounted_for");
+  assert.equal(accounted.length, 1); assert.equal(accounted[0].blocking, false);
+  assert.equal(accounted[0].regularizationId, input.regularizations[0].id);
+  assert.equal(accounted[0].receiptId, input.requests[1].id);
+  assert.equal(decision.diagnostics.some(issue => issue.blocking), false);
+  assert.deepEqual(reconstructSessions(input.logs, { now: input.evaluatedAt }), raw);
+  assert.ok(raw.sessions.every(session => session.exit === null));
+});
+
+const accreditedReentry = () => backendFixture(["clockIn", "regularizeSession", "clockIn"], "accredited_exit");
+for (const [label, operations, bootstrap] of [
+  ["subsequent ordinary exit", ["clockIn", "regularizeSession", "clockIn", "clockOut"], false],
+  ["two accredited resolutions", ["clockIn", "regularizeSession", "clockIn", "regularizeSession", "clockIn"], false],
+  ["original legacy bootstrap", ["regularizeSession", "clockIn"], true],
+]) test("accredited boundaries preserve an evolved state: " + label, () => {
+  const input = freeze(backendFixture(operations, "accredited_exit", bootstrap));
+  const decision = assertPreserved(input, "already_initialized", "evolved");
+  assert.equal(decision.diagnostics.filter(d => d.code === "consecutive_entries_accounted_for").length,
+    operations.filter(operation => operation === "regularizeSession").length);
+});
+
+test("accredited boundary permits a new entry exactly at regularization time", () => {
+  const input = accreditedReentry(), timestamp = { ...input.regularizations[0].data.regularizedAt };
+  input.logs[1].timestamp = timestamp; workerState(input).openedAt = { ...timestamp };
+  assertPreserved(freeze(input), "already_initialized", "evolved");
+});
+
+test("accredited boundary preserves an existing overdue needs_review state without replacement", () => {
+  const input = accreditedReentry(), state = workerState(input);
+  input.evaluatedAt = at(state.openedAt.seconds + 86401, state.openedAt.nanoseconds);
+  state.status = "needs_review"; state.reviewReason = "overdue";
+  assertPreserved(freeze(input), "already_initialized", "evolved");
+  assert.equal(state.status, "needs_review"); assert.equal(state.version, 3);
+});
+
+for (const [label, mutate] of [
+  ["pending resolution", input => { input.regularizations[0].data.status = "pending"; }],
+  ["missing resolution", input => { input.regularizations = []; }],
+  ["missing regularization receipt", input => { input.requests.splice(1, 1); }],
+  ["missing next-entry receipt", input => { input.requests.pop(); }],
+  ["wrong original reference", input => { input.regularizations[0].data.originalEntryId = "fictional-missing"; }],
+  ["wrong resolution document ID", input => { input.regularizations[0].id = "fictional-wrong-resolution"; }],
+  ["wrong worker", input => { input.regularizations[0].data.workerUid = "fictional-foreign-worker"; }],
+  ["wrong company", input => { input.regularizations[0].data.companyId = "fictional-foreign-company"; }],
+  ["non-admin actor", input => { input.regularizations[0].data.adminUid = userId; }],
+  ["incorrect stored duration", input => { input.regularizations[0].data.effectiveMinutes++; }],
+  ["receipt reference mismatch", input => { input.requests[1].data.result.originalEntryId = "fictional-missing"; }],
+  ["receipt status mismatch", input => { input.requests[1].data.result.status = "idle"; }],
+  ["unverifiable receipt fingerprint", input => { input.requests[1].data.payloadFingerprint = "invalid"; }],
+  ["incomplete version trace", input => { workerState(input).version++; }],
+  ["incompatible idle state", input => {
+    Object.assign(workerState(input), { status: "idle", activeEntryId: null, openedAt: null });
+  }],
+  ["new entry before regularization", input => {
+    const time = input.regularizations[0].data.regularizedAt;
+    input.logs[1].timestamp = at(time.seconds - 1, time.nanoseconds);
+    workerState(input).openedAt = { ...input.logs[1].timestamp };
+  }],
+  ["new entry overlaps credited duration", input => {
+    const time = input.regularizations[0].data.accreditedExitAt;
+    input.logs[1].timestamp = at(time.seconds - 1, time.nanoseconds);
+    workerState(input).openedAt = { ...input.logs[1].timestamp };
+  }],
+]) test("accredited evidence cannot clear ambiguity: " + label, () => {
+  const input = accreditedReentry(); mutate(input);
+  const decision = assertPreserved(freeze(input), "recovery_required");
+  assert.ok(decision.diagnostics.some(d => d.blocking));
+  assert.equal(codes(decision).includes("consecutive_entries_accounted_for"), false);
+  assert.equal(makeManifest(input).applicable, false);
+});
+
+for (const contradictory of [false, true]) test("duplicate accredited resolutions remain blocked: contradictory=" + contradictory, () => {
+  const input = accreditedReentry(), duplicate = structuredClone(input.regularizations[0]);
+  if (contradictory) { duplicate.data.accreditedExitAt.seconds += 60; duplicate.data.effectiveMinutes++; }
+  input.regularizations.push(duplicate);
+  const decision = assertPreserved(freeze(input), "recovery_required");
+  assert.ok(codes(decision).includes("duplicate_backend_document"));
+  assert.equal(codes(decision).includes("consecutive_entries_accounted_for"), false);
+  assert.equal(makeManifest(input).inventory.regularizations.count, 2);
+});
+
+test("duplicate accredited receipt remains blocked without selecting a winner", () => {
+  const input = accreditedReentry(); input.requests.push(structuredClone(input.requests[1]));
+  const decision = assertPreserved(freeze(input), "recovery_required");
+  assert.ok(codes(decision).includes("duplicate_backend_document"));
+  assert.equal(makeManifest(input).applicable, false);
+});
+
+test("unknown-duration regularization does not establish an accredited boundary", () => {
+  const input = freeze(backendFixture(["clockIn", "regularizeSession", "clockIn"], "unknown_exit"));
+  const decision = assertPreserved(input, "recovery_required");
+  assert.ok(codes(decision).includes("consecutive_entries"));
+  assert.equal(codes(decision).includes("consecutive_entries_accounted_for"), false);
+  assert.equal(input.regularizations[0].data.effectiveMinutes, null);
+  assert.equal(input.regularizations[0].data.accreditedExitAt, null);
+});
+
+test("a valid accredited trace never recreates an absent operational state", () => {
+  const input = accreditedReentry(); input.states = [];
+  assertPreserved(freeze(input), "recovery_required");
+});
+
+test("a new entry without an accredited resolution keeps raw consecutive entries blocked", () => {
+  const logs = [entry(), { ...entry("fictional-next-entry"), timestamp: later(1) }];
+  const input = fixture({ logs, states: [{ id: userId, data: idle({ status: "open",
+    activeEntryId: "fictional-next-entry", openedAt: later(1) }) }] });
+  const decision = assertPreserved(freeze(input), "recovery_required");
+  assert.ok(codes(decision).includes("consecutive_entries"));
+});
+
+test("accredited evidence cannot suppress a different raw history blocker", () => {
+  const input = accreditedReentry();
+  input.logs.push({ ...exit(), id: "fictional-orphan-exit", timestamp: { ...input.evaluatedAt },
+    entradaLogId: "fictional-missing-original" });
+  const decision = assertPreserved(freeze(input), "recovery_required");
+  assert.ok(codes(decision).includes("entry_not_found"));
+  assert.equal(codes(decision).includes("consecutive_entries_accounted_for"), false);
+});
+
+test("accredited resolution plus an actual exit for the same original remains contradictory", () => {
+  const input = accreditedReentry(), original = input.logs[0], resolution = input.regularizations[0].data;
+  input.logs.push({ id: "fictional-extra-exit", companyId, userId, tipo: "salida",
+    timestamp: { ...resolution.accreditedExitAt }, entradaLogId: original.id,
+    inicioSesion: { ...original.timestamp }, minutosSesion: resolution.effectiveMinutes });
+  const decision = assertPreserved(freeze(input), "recovery_required");
+  assert.ok(codes(decision).includes("regularization_trace_invalid"));
+});
+
+for (const source of manifestSources) test("incomplete " + source + " cannot establish an accredited boundary", () => {
+  const input = accreditedReentry(); input.complete[source] = false;
+  assertPreserved(freeze(input), "incomplete_source");
+  assert.equal(makeManifest(input).applicable, false);
+});
+
+test("accredited manifest is deterministic under source permutations and leaves every source intact", () => {
+  const input = freeze(backendFixture(["clockIn", "regularizeSession", "clockIn", "regularizeSession", "clockIn"], "accredited_exit"));
+  const before = structuredClone(input), manifest = makeManifest(input);
+  assert.equal(manifest.applicable, true);
+  assert.equal(manifest.planning.decisions.find(d => d.userId === userId).proposedState, null);
+  for (let i = 0; i < 12; i++) {
+    const permuted = structuredClone(input);
+    for (const [index, source] of manifestSources.entries()) {
+      if ((i + index) % 2) permuted[source].reverse();
+      if (permuted[source].length > 1) permuted[source].push(...permuted[source].splice(0, i % permuted[source].length));
+    }
+    assert.equal(JSON.stringify(makeManifest(permuted)), JSON.stringify(manifest));
+  }
+  manifest.planning.decisions.find(d => d.userId === userId).diagnostics.length = 0;
+  assert.deepEqual(input, before);
+  assert.ok(makeManifest(input).planning.decisions.find(d => d.userId === userId).diagnostics
+    .some(d => d.code === "consecutive_entries_accounted_for"));
+});
+
+test("accredited traces remain independent between companies", () => {
+  const snapshots = simulationCompanies.map(company => {
+    const input = simulationInput(company), uid = simulationWorker(input, "accredited-reentry");
+    simulationBackend(input, uid, ["clockIn", "regularizeSession", "clockIn"], "accredited_exit");
+    return input;
+  });
+  const second = makeManifest(freeze(snapshots[1]));
+  assert.equal(second.applicable, true);
+  const first = makeManifest(freeze(snapshots[0])); assert.equal(first.applicable, true);
+  const changed = structuredClone(snapshots[0]); changed.regularizations[0].data.status = "pending";
+  assert.equal(makeManifest(changed).applicable, false);
+  assert.deepEqual(makeManifest(snapshots[1]), second);
+});
+
+test("foreign-company accredited evidence never clears a consecutive-entry blocker", () => {
+  const input = accreditedReentry(); input.regularizations[0].data.companyId = "fictional-foreign-company";
+  const decision = assertPreserved(freeze(input), "recovery_required");
+  assert.ok(codes(decision).includes("company_scope_mismatch"));
+  assert.equal(codes(decision).includes("consecutive_entries_accounted_for"), false);
+});
+
+test("one nanosecond before regularization is not a valid next-entry boundary", () => {
+  const input = accreditedReentry(), time = input.regularizations[0].data.regularizedAt;
+  input.logs[1].timestamp = at(time.seconds, time.nanoseconds - 1);
+  workerState(input).openedAt = { ...input.logs[1].timestamp };
+  const decision = assertPreserved(freeze(input), "recovery_required");
+  assert.ok(codes(decision).includes("backend_transition_trace_conflict"));
+  assert.equal(codes(decision).includes("consecutive_entries_accounted_for"), false);
+});
+
+test("one accredited boundary cannot conceal another untraced open entry", () => {
+  const input = accreditedReentry();
+  input.logs.push({ ...entry("fictional-untraced-entry"), timestamp: { ...input.evaluatedAt } });
+  const decision = assertPreserved(freeze(input), "recovery_required");
+  assert.ok(codes(decision).includes("untracked_log_during_backend_activity"));
+  assert.equal(codes(decision).includes("consecutive_entries_accounted_for"), false);
+  assert.equal(input.logs.length, 3);
 });

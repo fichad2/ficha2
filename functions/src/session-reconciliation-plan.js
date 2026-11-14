@@ -192,8 +192,28 @@ function inspectExistingTrace(input, person, core, owned) {
   const missingEvidence = new Set(["backend_version_trace_incomplete", "state_latest_receipt_missing",
     "regularization_receipt_missing", "state_resolution_missing", "initial_review_provenance_missing", "review_provenance_missing"]);
   const blockers = diagnostics.filter(d => d.blocking);
+  // A raw adjacency can be accounted for only by a fully verified preserved
+  // backend trace. These are references to existing evidence, never synthetic
+  // exits, reconstructed states or replacements for the raw history verdict.
+  const accreditedBoundaries = [];
+  if (!blockers.length) for (let i = 0; i < operations.length - 1; i++) {
+    const operation = operations[i], next = operations[i + 1];
+    if (operation.result.operation !== "regularizeSession" || operation.result.mode !== "accredited_exit"
+      || next.result.operation !== "clockIn") continue;
+    const previousId = operation.result.originalEntryId, nextId = next.result.originalEntryId;
+    const resolution = resolutions.get(previousId), nextEntry = original(nextId);
+    if (!resolution || !nextEntry || previousId === nextId
+      || instantNs(resolution.data.accreditedExitAt) > instantNs(nextEntry.timestamp)
+      || instantNs(resolution.data.regularizedAt) > instantNs(nextEntry.timestamp)) continue;
+    // Require unique evidence for this exception. This does not reclassify
+    // unrelated global duplicates (handled separately by the manifest).
+    if (input.regularizations.filter(doc => doc?.id === previousId).length !== 1
+      || [operation, next].some(op => input.requests.filter(doc => doc?.id === op.receipt.requestKey).length !== 1)) continue;
+    accreditedBoundaries.push({ previousEntryId: previousId, nextEntryId: nextId,
+      regularizationId: previousId, receiptId: operation.receipt.requestKey });
+  }
   return { diagnostics, kind: blockers.length ? blockers.some(d => !missingEvidence.has(d.code)) ? "incoherent" : "unverified"
-    : core.version === 0 ? "initialized" : "evolved" };
+    : core.version === 0 ? "initialized" : "evolved", accreditedBoundaries };
 }
 
 /**
@@ -230,6 +250,9 @@ function inspectExistingTrace(input, person, core, owned) {
  * backend receipt/version/event trace. It does not certify external provenance,
  * initialization manifests or original request payloads. Existing states are
  * never returned as replacement proposals, including overdue projections.
+ * Raw consecutive-entry issues may be explicitly accounted for by a unique,
+ * verified accredited-resolution/next-entry receipt boundary. All other raw
+ * blockers remain effective; neither logs nor reconstruction results change.
  *
  * The same DTOs and fixed evaluatedAt produce the same output. Diagnostic indexes
  * refer to the supplied array positions; no input record is reordered or changed.
@@ -368,7 +391,11 @@ export function planSessionReconciliation(input) {
     if (p.profiles.length !== 1) diagnostics.push(diagnostic(
       p.profiles.length ? "duplicate_profile" : "profile_missing", "profiles", [], [p.uid]));
     if (globalRecovery) return result(PLANNING_DECISION.RECOVERY_REQUIRED);
-    if (globalBlocked || diagnostics.some(d => d.blocking)) {
+    // Defer ONLY raw adjacencies for one existing state, long enough to check
+    // its complete backend trace. New-state planning never gets this exception.
+    const deferredAdjacencies = new Set(p.states.length === 1
+      ? diagnostics.filter(d => d.blocking && d.source === "logs" && d.code === "consecutive_entries") : []);
+    if (globalBlocked || diagnostics.some(d => d.blocking && !deferredAdjacencies.has(d))) {
       return result(p.states.length || p.artifacts.length || backendLogs.length
         ? PLANNING_DECISION.RECOVERY_REQUIRED : PLANNING_DECISION.BLOCKED);
     }
@@ -405,7 +432,17 @@ export function planSessionReconciliation(input) {
       const trace = inspectExistingTrace(input, p, core, owned);
       existingStateKind = trace.kind;
       diagnostics.push(...trace.diagnostics);
-      if (trace.diagnostics.some(d => d.blocking)) return result(PLANNING_DECISION.RECOVERY_REQUIRED);
+      if (!trace.diagnostics.some(d => d.blocking)) for (const issue of deferredAdjacencies) {
+        const proof = trace.accreditedBoundaries.find(boundary => issue.recordIds.length === 2
+          && issue.recordIds.includes(boundary.previousEntryId) && issue.recordIds.includes(boundary.nextEntryId));
+        if (proof) diagnostics[diagnostics.indexOf(issue)] = { ...issue,
+          code: "consecutive_entries_accounted_for", blocking: false,
+          regularizationId: proof.regularizationId, receiptId: proof.receiptId };
+      }
+      if (diagnostics.some(d => d.blocking)) {
+        if (["initialized", "evolved"].includes(existingStateKind)) existingStateKind = "incoherent";
+        return result(PLANNING_DECISION.RECOVERY_REQUIRED);
+      }
       if (inspected.state.status !== core.status) diagnostics.push(diagnostic("existing_overdue_projection_not_persisted", "states", [], [p.uid], false));
       diagnostics.push(diagnostic("existing_state_preserved_not_reconciled", "states", [], [p.uid], false));
       return result(PLANNING_DECISION.ALREADY_INITIALIZED);
@@ -434,7 +471,7 @@ export function planSessionReconciliation(input) {
 }
 
 export const RECONCILIATION_MANIFEST_SCHEMA = 1;
-export const RECONCILIATION_ALGORITHM = "fichad2-reconciliation/3.7.4-v1";
+export const RECONCILIATION_ALGORITHM = "fichad2-reconciliation/3.7.4-v2";
 
 /**
  * Versioned, typed canonical encoding, NOT ordinary JSON serialization.
