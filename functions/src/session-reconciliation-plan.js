@@ -42,9 +42,165 @@ function diagnostic(code, source, recordIndexes = [], recordIds = [], blocking =
     recordIds: [...recordIds].sort(compare), blocking };
 }
 
+const uuid = value => typeof value === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/.test(value);
+const hexDigest = value => typeof value === "string" && /^[a-f0-9]{64}$/.test(value);
+const receiptResultFields = ["operation", "eventId", "originalEntryId", "stateVersion", "status", "minutes", "exitAt", "mode"];
+const validInstant = value => value instanceof Date ? Number.isFinite(value.getTime()) : timestamp(value);
+const sameInstant = (a, b) => validInstant(a) && validInstant(b) && instantNs(a) === instantNs(b);
+
+// Observational trace validation only. Never replay operations or return a
+// replacement state. Unknown/missing evidence is a recovery requirement.
+// The original request body/epoch is not stored in receipts: payloadFingerprint
+// can be shape-checked, not recomputed or authenticated by this local planner.
+function inspectExistingTrace(input, person, core, owned) {
+  const diagnostics = [];
+  const issue = (code, source, index = null, recordId = person.uid, blocking = true) => {
+    diagnostics.push(diagnostic(code, source, index === null ? [] : [index], [recordId], blocking));
+  };
+  const ownLogs = input.logs.filter(log => log.userId === person.uid);
+  const original = entryId => ownLogs.find(log => log.id === entryId && log.tipo === "entrada");
+  const regs = person.artifacts.filter(a => a.source === "regularizations");
+  const receipts = person.artifacts.filter(a => a.source === "requests");
+  const resolutions = new Map(), operations = [];
+  for (const source of ["regularizations", "requests"]) {
+    const counts = new Map();
+    for (const artifact of person.artifacts.filter(a => a.source === source)) counts.set(artifact.id, (counts.get(artifact.id) ?? 0) + 1);
+    for (const [recordId, count] of counts) if (count > 1) issue("duplicate_backend_document", source, null, recordId);
+  }
+  for (const artifact of regs) {
+    const reg = input.regularizations[artifact.index].data, entry = original(reg.originalEntryId);
+    const resolution = { regularizationId: artifact.id, originalEntryId: reg.originalEntryId,
+      mode: reg.mode, minutes: reg.effectiveMinutes, exitAt: reg.accreditedExitAt,
+      regularizedAt: reg.regularizedAt, adminUid: reg.adminUid };
+    const projected = { ...core, status: SESSION_STATUS.REGULARIZED, activeEntryId: null,
+      openedAt: null, reviewReason: null, lastResolution: resolution };
+    const checked = inspectSessionState(projected, input.evaluatedAt);
+    const known = reg.mode === "accredited_exit";
+    const admins = input.profiles.filter(p => p.id === reg.adminUid);
+    const admin = admins.length === 1 && admins[0].companyId === input.companyId && admins[0].role === "administrador";
+    let valid = reg.schemaVersion === DOMAIN_VERSION && entry && checked.ok && admin
+      && uuid(reg.requestId) && timestamp(reg.regularizedAt)
+      && typeof reg.reason === "string" && reg.reason.trim().length > 0 && reg.reason.length <= 1000
+      && (known ? typeof reg.evidenceReference === "string" && reg.evidenceReference.trim().length > 0
+        && reg.evidenceReference.length <= 500 && timestamp(reg.accreditedExitAt)
+        : reg.evidenceReference === null && reg.accreditedExitAt === null)
+      && reg.status === (known ? "resolved_known" : "resolved_unknown");
+    if (valid) {
+      const start = instantNs(entry.timestamp), resolved = instantNs(reg.regularizedAt);
+      valid = resolved - start > 86_400_000_000_000n
+        && !ownLogs.some(log => log.tipo === "salida" && log.entradaLogId === entry.id);
+      if (known) {
+        const end = instantNs(reg.accreditedExitAt), duration = end - start;
+        valid &&= duration > 0n && duration <= 86_400_000_000_000n && end <= resolved
+          && reg.effectiveMinutes === Number(duration / 60_000_000_000n)
+          && !ownLogs.some(log => log.tipo === "entrada" && log.id !== entry.id
+            && instantNs(log.timestamp) > start && instantNs(log.timestamp) < end);
+      } else valid &&= !ownLogs.some(log => log.tipo === "entrada" && log.id !== entry.id && instantNs(log.timestamp) > start);
+    }
+    if (!valid) issue("regularization_trace_invalid", "regularizations", artifact.index, artifact.id);
+    else resolutions.set(artifact.id, { data: reg, resolution });
+  }
+  for (const artifact of receipts) {
+    const receipt = input.requests[artifact.index].data, r = receipt.result;
+    const isEntry = receipt.operation === "clockIn", isExit = receipt.operation === "clockOut";
+    const isReg = receipt.operation === "regularizeSession";
+    let valid = receipt.schemaVersion === DOMAIN_VERSION && uuid(receipt.requestId) && id(receipt.actorUid)
+      && hexDigest(receipt.requestKey) && receipt.requestKey === artifact.id && hexDigest(receipt.payloadFingerprint)
+      && receipt.requestKey === createHash("sha256").update(JSON.stringify([
+        DOMAIN_VERSION, input.companyId, receipt.actorUid, receipt.requestId,
+      ])).digest("hex") && exactKeys(r, receiptResultFields) && r.operation === receipt.operation
+      && Number.isSafeInteger(r.stateVersion) && r.stateVersion > 0 && r.stateVersion <= core.version
+      && (isEntry || isExit || isReg) && id(r.eventId) && id(r.originalEntryId);
+    let effectiveAt = null;
+    const entry = valid ? original(r.originalEntryId) : null;
+    if (valid && (isEntry || isExit)) {
+      const event = ownLogs.find(log => log.id === r.eventId);
+      valid = receipt.actorUid === person.uid && (receipt.workerUid === undefined || receipt.workerUid === person.uid)
+        && entry && event && r.eventId === (isEntry ? "entry_" : "exit_") + receipt.requestKey
+        && event.tipo === (isEntry ? "entrada" : "salida") && r.mode === null
+        && r.status === (isEntry ? SESSION_STATUS.OPEN : SESSION_STATUS.IDLE);
+      if (valid && isEntry) valid = r.originalEntryId === event.id && r.minutes === null && r.exitAt === null;
+      if (valid && isExit) valid = event.entradaLogId === entry.id && timestamp(r.exitAt)
+        && sameInstant(event.timestamp, r.exitAt) && sameInstant(event.inicioSesion, entry.timestamp)
+        && Number.isSafeInteger(r.minutes) && r.minutes >= 0 && r.minutes <= 1440
+        && r.minutes === Number((instantNs(event.timestamp) - instantNs(entry.timestamp)) / 60_000_000_000n)
+        && (event.minutosSesion === undefined || event.minutosSesion === r.minutes);
+      if (valid) effectiveAt = copyOriginalTimestamp(event.timestamp);
+    } else if (valid && isReg) {
+      const resolution = resolutions.get(r.originalEntryId);
+      valid = entry && resolution && (receipt.workerUid === undefined || receipt.workerUid === person.uid)
+        && resolution.data.requestId === receipt.requestId && resolution.data.adminUid === receipt.actorUid
+        && r.eventId === r.originalEntryId && r.status === SESSION_STATUS.REGULARIZED
+        && r.mode === resolution.data.mode && r.minutes === resolution.data.effectiveMinutes
+        && (r.exitAt === null ? resolution.data.accreditedExitAt === null
+          : timestamp(r.exitAt) && sameInstant(r.exitAt, resolution.data.accreditedExitAt));
+      if (valid) effectiveAt = copyOriginalTimestamp(resolution.data.regularizedAt);
+    }
+    if (!valid || !effectiveAt || instantNs(effectiveAt) > instantNs(input.evaluatedAt)) {
+      issue("receipt_trace_invalid", "requests", artifact.index, artifact.id);
+    } else operations.push({ receipt, result: r, effectiveAt });
+  }
+  operations.sort((a, b) => a.result.stateVersion - b.result.stateVersion || compare(a.receipt.requestKey, b.receipt.requestKey));
+  for (const log of ownLogs) if (/^(entry|exit)_[0-9a-f]{64}$/.test(log.id)
+    && !operations.some(op => op.result.eventId === log.id)) issue("backend_event_receipt_missing", "logs", input.logs.indexOf(log), log.id);
+  if (core.version === 0) {
+    if (core.lastRequestId !== null || core.lastResolution !== null || person.artifacts.length) issue("initial_state_has_backend_activity", "states");
+    if (["manual_review", "history_conflict"].includes(core.reviewReason)) issue("initial_review_provenance_missing", "states");
+  } else {
+    // All supplied sources claim completeness. Missing version receipts are not
+    // inferred from the current version or arbitrary initialization metadata.
+    if (core.lastRequestId === null || operations.length !== core.version
+      || operations.some((op, index) => op.result.stateVersion !== index + 1)) {
+      issue("backend_version_trace_incomplete", "requests");
+    }
+    for (let i = 1; i < operations.length; i++) {
+      const previous = operations[i - 1], next = operations[i];
+      const prevOpen = previous.result.operation === "clockIn";
+      if (instantNs(previous.effectiveAt) > instantNs(next.effectiveAt)
+        || (prevOpen ? next.result.operation === "clockIn" || next.result.originalEntryId !== previous.result.originalEntryId
+          : next.result.operation !== "clockIn")) issue("backend_transition_trace_conflict", "requests");
+    }
+    const last = operations.at(-1);
+    if (!last) issue("state_latest_receipt_missing", "requests");
+    else if (last.receipt.requestId !== core.lastRequestId || last.result.stateVersion !== core.version
+      || (last.result.status === SESSION_STATUS.OPEN
+        ? ![SESSION_STATUS.OPEN, SESSION_STATUS.NEEDS_REVIEW].includes(core.status)
+          || core.activeEntryId !== last.result.originalEntryId || !sameInstant(core.openedAt, last.effectiveAt)
+        : last.result.status !== core.status)) issue("state_latest_receipt_mismatch", "states");
+    if (last && ownLogs.some(log => instantNs(log.timestamp) > instantNs(last.effectiveAt))) issue("history_after_latest_backend_receipt", "logs");
+    const first = operations[0];
+    if (first && ownLogs.some(log => instantNs(log.timestamp) >= instantNs(first.effectiveAt)
+      && !operations.some(op => op.result.eventId === log.id))) issue("untracked_log_during_backend_activity", "logs");
+    // Manual review has no supported domain operation/receipt to explain it.
+    if (["manual_review", "history_conflict"].includes(core.reviewReason)) issue("review_provenance_missing", "states");
+  }
+  for (const [entryId, resolution] of resolutions) {
+    if (!operations.some(op => op.result.operation === "regularizeSession" && op.result.originalEntryId === entryId)) {
+      issue("regularization_receipt_missing", "regularizations", null, entryId);
+    }
+    if (core.status === SESSION_STATUS.REGULARIZED && core.lastResolution?.originalEntryId === entryId
+      && canonicalizeReconciliationValue(core.lastResolution) !== canonicalizeReconciliationValue(resolution.resolution)) {
+      issue("state_resolution_mismatch", "states");
+    }
+  }
+  if (core.status === SESSION_STATUS.REGULARIZED && !resolutions.has(core.lastResolution.originalEntryId)) issue("state_resolution_missing", "states");
+  const unresolved = owned.filter(s => s.status === "open" && !resolutions.has(s.entry.id));
+  const active = [SESSION_STATUS.OPEN, SESSION_STATUS.NEEDS_REVIEW].includes(core.status);
+  if (active && core.reviewReason === "overdue" && instantNs(input.evaluatedAt) - instantNs(core.openedAt) <= 86_400_000_000_000n) issue("review_not_overdue", "states");
+  if (active ? unresolved.length !== 1 || unresolved[0].entry.id !== core.activeEntryId : unresolved.length !== 0) issue("unresolved_history_state_mismatch", "states");
+  if (!diagnostics.some(d => d.blocking)) issue(core.version === 0 ? "existing_initial_state_verified" : "existing_backend_trace_verified", "states", null, person.uid, false);
+  const missingEvidence = new Set(["backend_version_trace_incomplete", "state_latest_receipt_missing",
+    "regularization_receipt_missing", "state_resolution_missing", "initial_review_provenance_missing", "review_provenance_missing"]);
+  const blockers = diagnostics.filter(d => d.blocking);
+  return { diagnostics, kind: blockers.length ? blockers.some(d => !missingEvidence.has(d.code)) ? "incoherent" : "unverified"
+    : core.version === 0 ? "initialized" : "evolved" };
+}
+
 /**
- * Pure, company-scoped classification/proposals; no SDK, I/O, clock reads, randomness,
- * hashing, manifest or persistence. The caller supplies plain trusted DTOs:
+ * Pure, company-scoped classification/proposals and observed trace checks;
+ * no SDK, I/O, clock reads, randomness or persistence. Receipt identity hashes
+ * follow the domain contract; manifest generation remains a separate API.
+ * The caller supplies plain trusted DTOs:
  * {
  *   companyId, evaluatedAt: {seconds, nanoseconds},
  *   complete: {profiles: boolean, logs: boolean, states: boolean,
@@ -70,9 +226,10 @@ function diagnostic(code, source, recordIndexes = [], recordIds = [], blocking =
  * never returned as replacement proposals and their versions are never reset.
  * Proposed timestamps are detached {seconds, nanoseconds} DTOs. Original DTOs
  * retain every nanosecond; legacy Dates retain their exact millisecond instant.
- * already_initialized only recognizes a valid preserved core state with no
- * detected raw-history conflict; it does not certify provenance or reconcile
- * regularizations/receipts. No existing document is returned as a replacement.
+ * already_initialized requires a coherent initial state or a complete observed
+ * backend receipt/version/event trace. It does not certify external provenance,
+ * initialization manifests or original request payloads. Existing states are
+ * never returned as replacement proposals, including overdue projections.
  *
  * The same DTOs and fixed evaluatedAt produce the same output. Diagnostic indexes
  * refer to the supplied array positions; no input record is reordered or changed.
@@ -142,6 +299,18 @@ export function planSessionReconciliation(input) {
     }
   }
 
+  // A cross-worker backend reference undermines both sides; do not let the
+  // target worker be independently certified using an apparently empty trace.
+  for (const p of [...people.values()]) for (const artifact of p.artifacts) {
+    const data = input[artifact.source][artifact.index].data;
+    const references = artifact.source === "regularizations" ? [data.originalEntryId]
+      : [data.result?.originalEntryId, data.result?.eventId];
+    for (const log of input.logs) if (references.includes(log?.id) && id(log?.userId) && log.userId !== p.uid) {
+      const d = diagnostic("backend_reference_scope_mismatch", artifact.source, [artifact.index], [artifact.id]);
+      p.diagnostics.push(d); person(log.userId).diagnostics.push(d);
+    }
+  }
+
   // Never diagnose a missing reference as a confirmed conflict in a partial load.
   const history = complete ? reconstructSessions(input.logs, { now: input.evaluatedAt }) : null;
   if (history) for (const issue of history.issues) {
@@ -167,8 +336,12 @@ export function planSessionReconciliation(input) {
 
   const decisions = [...people.values()].sort((a, b) => compare(a.uid, b.uid)).map(p => {
     const diagnostics = [...p.diagnostics, ...globalDiagnostics];
+    const backendLogs = input.logs.filter(log => log?.userId === p.uid && /^(entry|exit)_[0-9a-f]{64}$/.test(log.id));
+    if (!p.states.length && backendLogs.length) diagnostics.push(diagnostic("backend_event_without_state", "logs",
+      backendLogs.map(log => input.logs.indexOf(log)), backendLogs.map(log => log.id)));
+    let existingStateKind = p.states.length ? complete ? "incoherent" : "unverified" : null;
     const result = (decision, historyKind = null, proposedStatus = null, openEntryId = null, proposedState = null) => ({
-      userId: p.uid, decision, historyKind, proposedStatus, openEntryId, proposedState,
+      userId: p.uid, decision, historyKind, proposedStatus, openEntryId, proposedState, existingStateKind,
       diagnostics: sorted(diagnostics),
     });
     const eligible = (historyKind, status, entry = null) => {
@@ -196,7 +369,7 @@ export function planSessionReconciliation(input) {
       p.profiles.length ? "duplicate_profile" : "profile_missing", "profiles", [], [p.uid]));
     if (globalRecovery) return result(PLANNING_DECISION.RECOVERY_REQUIRED);
     if (globalBlocked || diagnostics.some(d => d.blocking)) {
-      return result(p.states.length || p.artifacts.length
+      return result(p.states.length || p.artifacts.length || backendLogs.length
         ? PLANNING_DECISION.RECOVERY_REQUIRED : PLANNING_DECISION.BLOCKED);
     }
     if (p.states.length) {
@@ -208,6 +381,7 @@ export function planSessionReconciliation(input) {
       const core = Object.fromEntries(stateFields.map(field => [field, stored[field]]));
       const inspected = inspectSessionState(core, input.evaluatedAt);
       if (stored.userId !== p.uid || !inspected.ok) {
+        existingStateKind = "incoherent";
         diagnostics.push(diagnostic("invalid_existing_state", "states", [], [p.uid]));
         return result(PLANNING_DECISION.RECOVERY_REQUIRED);
       }
@@ -228,6 +402,11 @@ export function planSessionReconciliation(input) {
         diagnostics.push(diagnostic("existing_active_entry_has_resolution", "states", [], [p.uid]));
         return result(PLANNING_DECISION.RECOVERY_REQUIRED);
       }
+      const trace = inspectExistingTrace(input, p, core, owned);
+      existingStateKind = trace.kind;
+      diagnostics.push(...trace.diagnostics);
+      if (trace.diagnostics.some(d => d.blocking)) return result(PLANNING_DECISION.RECOVERY_REQUIRED);
+      if (inspected.state.status !== core.status) diagnostics.push(diagnostic("existing_overdue_projection_not_persisted", "states", [], [p.uid], false));
       diagnostics.push(diagnostic("existing_state_preserved_not_reconciled", "states", [], [p.uid], false));
       return result(PLANNING_DECISION.ALREADY_INITIALIZED);
     }
@@ -255,7 +434,7 @@ export function planSessionReconciliation(input) {
 }
 
 export const RECONCILIATION_MANIFEST_SCHEMA = 1;
-export const RECONCILIATION_ALGORITHM = "fichad2-reconciliation/3.7.3-v1";
+export const RECONCILIATION_ALGORITHM = "fichad2-reconciliation/3.7.4-v1";
 
 /**
  * Versioned, typed canonical encoding, NOT ordinary JSON serialization.
