@@ -34,7 +34,7 @@ export function createClockInHandler({ environment, readUser, execute, HttpsErro
   };
 }
 
-// Only clockOut opts in. Existing entry/regularization authentication and error
+// Recovery-capable handlers opt in. Existing entry authentication and error
 // handling above remain unchanged. The capability is private server context;
 // no request data can supply it or replace the original token's claims.
 export function createClockOutHandler({ environment, readUser, execute, HttpsError }) {
@@ -62,3 +62,7 @@ export function createClockOutHandler({ environment, readUser, execute, HttpsErr
     })({ ...request, auth: uid ? { uid, token } : null });
   };
 }
+
+// The same private Auth capability and public error mapping serve both closing
+// operations. Reuse them without changing clockIn or clockOut behavior.
+export const createRegularizeSessionHandler = createClockOutHandler;

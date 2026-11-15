@@ -4,7 +4,7 @@ import { assertEmulatorEnvironment } from "./emulator-environment.js";
 import { createRegularizeSessionService } from "./regularize-session-service.js";
 import { createClockOutService } from "./clock-out-service.js";
 import { createClockInService } from "./clock-in-service.js";
-import { createClockInHandler, createClockOutHandler } from "./clock-in-callable.js";
+import { createClockInHandler, createClockOutHandler, createRegularizeSessionHandler } from "./clock-in-callable.js";
 import { createHealthHandler } from "./emulator-health.js";
 
 // Fail before importing/initializing Firebase SDKs unless all destinations are
@@ -59,6 +59,6 @@ export const clockOut = onCall({ region: "us-central1", maxInstances: 1 }, creat
 
 const executeRegularizeSession = createRegularizeSessionService({ firestore, environment, now: () => Timestamp.now(),
   serverTimestamp: () => FieldValue.serverTimestamp(), toTimestamp: ({ seconds, nanoseconds }) => new Timestamp(seconds, nanoseconds) });
-export const regularizeSession = onCall({ region: "us-central1", maxInstances: 1 }, createClockInHandler({
+export const regularizeSession = onCall({ region: "us-central1", maxInstances: 1 }, createRegularizeSessionHandler({
   environment, readUser: (uid) => auth.getUser(uid), execute: executeRegularizeSession, HttpsError,
 }));

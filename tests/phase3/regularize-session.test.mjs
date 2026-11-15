@@ -4,7 +4,7 @@ import { randomUUID, createHash } from "node:crypto";
 import { createRequire } from "node:module";
 import { createRegularizeSessionService } from "../../functions/src/regularize-session-service.js";
 import { ClockInError } from "../../functions/src/clock-in-service.js";
-import { createClockInHandler } from "../../functions/src/clock-in-callable.js";
+import { createRegularizeSessionHandler } from "../../functions/src/clock-in-callable.js";
 import { validateOverdueRegularization } from "../../functions/src/session-domain.js";
 import { assertEmulatorEnvironment } from "../../functions/src/emulator-environment.js";
 const local = assertEmulatorEnvironment(process.env);
@@ -21,10 +21,16 @@ const db = new Firestore({ projectId: local.projectId, host: local.firestore, ss
   credentials: { client_email: "emulator@example.invalid", private_key: "emulator-only-not-a-private-key" } });
 after(async () => { await db.terminate(); await deleteApp(app); });
 const environment = () => process.env;
-const serviceFor = (firestore = db, clock = () => Timestamp.now(), env = environment) => createRegularizeSessionService({
-  firestore, environment: env, now: clock, serverTimestamp: () => FieldValue.serverTimestamp(),
-  toTimestamp: ({ seconds, nanoseconds }) => new Timestamp(seconds, nanoseconds),
-});
+const serviceFor = (firestore = db, clock = () => Timestamp.now(), env = environment) => {
+  const execute = createRegularizeSessionService({ firestore, environment: env, now: clock,
+    serverTimestamp: () => FieldValue.serverTimestamp(),
+    toTimestamp: ({ seconds, nanoseconds }) => new Timestamp(seconds, nanoseconds) });
+  return input => execute({ ...input, reauthorize: input.reauthorize ?? (async identity => {
+    const user = await auth.getUser(identity.uid);
+    if (user.uid !== identity.uid || user.disabled) throw new ClockInError("UNAUTHENTICATED");
+    if (!user.emailVerified) throw new ClockInError("EMAIL_NOT_VERIFIED");
+  }) });
+};
 const service = serviceFor();
 const jsonTime = t => ({ seconds: t.seconds, nanoseconds: t.nanoseconds });
 async function actor(companyId, { role = "administrador", verified = true, profile = true } = {}) {
@@ -468,9 +474,17 @@ test("foreign administrator with valid own-company context cannot regularize thi
 // emulator transactions, with deterministic faults at explicit boundaries;
 // they do not explain the cause of any historical SDK/emulator failure.
 const nativeFault = (code, message) => Object.assign(new Error(message), { code });
-const transactionAdapter = runTransaction => ({ projectId: local.projectId,
-  doc: p => db.doc(p), collection: p => db.collection(p), runTransaction });
-const handlerFor = execute => createClockInHandler({ environment, execute,
+// Confirmation probes are distinct read-only operations. Existing write-fault
+// fixtures preserve their exact expectations and do not count probes as writes.
+const transactionAdapter = (runTransaction, { confirmationFailure } = {}) => ({ projectId: local.projectId,
+  doc: p => db.doc(p), collection: p => db.collection(p), runTransaction: (action, options) => {
+    if (options?.readOnly) {
+      if (confirmationFailure) throw confirmationFailure;
+      return db.runTransaction(action, options);
+    }
+    return runTransaction(action, options);
+  } });
+const handlerFor = execute => createRegularizeSessionHandler({ environment, execute,
   readUser: uid => auth.getUser(uid), HttpsError });
 const handlerRequest = async f => ({ data: f.request,
   auth: { uid: f.admin.uid, token: await auth.verifyIdToken(f.admin.token) } });
@@ -625,7 +639,7 @@ for (const committedBeforeFailure of [false, true]) test("controlled regularizat
   const wrapper = transactionAdapter(async action => {
     if (committedBeforeFailure) { committedResult = await db.runTransaction(action); throw unavailable; }
     return db.runTransaction(async tx => { await action(tx); throw unavailable; }, { maxAttempts: 1 });
-  });
+  }, { confirmationFailure: unavailable });
   await assert.rejects(handlerFor(serviceFor(wrapper))(await handlerRequest(f)), error => {
     assert.equal(error.code, "unavailable"); assert.equal(error.details.code, "CONFIRMATION_UNAVAILABLE");
     assert.equal(error.details.retryable, true); assert.equal(error.details.outcomeUnknown, true); return true;
@@ -648,3 +662,314 @@ test("controlled regularization business conflicts remain distinct from uncertai
   });
   assert.deepEqual(await effects(f), baseline.effects); assert.deepEqual(await originalSnapshot(f), baseline.original);
 });
+
+// Integration faults are deterministic boundary injections. Actual reads,
+// rollback and atomic effects remain those of the isolated Firestore emulator.
+function recoveryAdapter({ historyErrors = [], beforeCommitErrors = [], afterCommitErrors = [],
+  beforeProbe, beforeExecution, onFailure, confirmationError } = {}) {
+  const observed = { executions: 0, probes: 0, callbacks: 0, maxAttempts: [], transactions: [], nativeIds: [] };
+  const adapter = transactionAdapter(async (action, options) => {
+    observed.executions++;
+    observed.maxAttempts.push(options.maxAttempts);
+    if (beforeExecution) await beforeExecution(observed.executions);
+    try {
+      const result = await db.runTransaction(async tx => {
+        observed.callbacks++;
+        observed.transactions.push(tx);
+        let failed = false;
+        const value = await action({
+          getAll: (...refs) => tx.getAll(...refs),
+          get: async ref => {
+            if (typeof ref.where === "function" && !failed && historyErrors.length) {
+              failed = true;
+              const id = await tx._transactionIdPromise; // Test-only observation.
+              observed.nativeIds.push(Buffer.from(id).toString("base64"));
+              throw historyErrors.shift();
+            }
+            return tx.get(ref);
+          },
+          create: (ref, data) => tx.create(ref, data), update: (ref, data) => tx.update(ref, data),
+        });
+        const error = beforeCommitErrors.shift();
+        if (error) throw error;
+        return value;
+      }, options);
+      const error = afterCommitErrors.shift();
+      if (error) throw error;
+      return result;
+    } catch (error) {
+      if (onFailure) await onFailure(error, observed.executions);
+      throw error;
+    }
+  });
+  const run = adapter.runTransaction;
+  adapter.runTransaction = async (action, options) => {
+    if (options.readOnly) {
+      observed.probes++;
+      if (beforeProbe) await beforeProbe(observed.probes);
+      if (confirmationError) throw confirmationError;
+    }
+    return run(action, options);
+  };
+  return { adapter, observed };
+}
+const closedHistory = () => Object.assign(nativeFault(3, "3 INVALID_ARGUMENT: Transaction is invalid or closed."), {
+  cause: nativeFault(10, "Fictional ABORTED before streaming retry"),
+});
+const invokeRecovery = async (f, adapter) => handlerFor(serviceFor(adapter))(await handlerRequest(f));
+
+async function verifyRecovery(f, execute, { code = null, changed = false, replayed = false,
+  winningAdmin = f.admin, compareEffects } = {}) {
+  const baseline = await concurrentBaseline(f);
+  const outcome = await execute().then(value => ({ value }), error => ({ error }));
+  const snapshots = await Promise.allSettled([effects(f), originalSnapshot(f)]), failures = [];
+  const check = (label, assertion) => { try { assertion(); } catch { failures.push(label); } };
+  check("effects readable", () => assert.equal(snapshots[0].status, "fulfilled"));
+  check("original readable", () => assert.equal(snapshots[1].status, "fulfilled"));
+  check("response", () => {
+    if (code !== null) assert.equal(outcome.error?.details?.code ?? outcome.error?.code, code);
+    else { assert.equal(outcome.error, undefined); assert.equal(outcome.value.ok, true); assert.equal(outcome.value.replayed, replayed); }
+  });
+  if (snapshots[1].status === "fulfilled") check("original preserved", () => assert.deepEqual(snapshots[1].value, baseline.original));
+  if (snapshots[0].status === "fulfilled") {
+    const e = snapshots[0].value;
+    check("all original logs and updateTimes preserved, no invented exit", () => assert.deepEqual(e.logs, baseline.effects.logs));
+    if (compareEffects) check("exact externally seeded fixture preserved", () => compareEffects(e));
+    else if (!changed) check("no partial effects", () => assert.deepEqual(e, baseline.effects));
+    else {
+      check("one resolution", () => assert.equal(e.regs.length, 1));
+      check("one receipt", () => assert.equal(e.receipts.length, 1));
+      check("one state transition", () => { assert.equal(e.state.data.version, 2); assert.equal(e.state.data.status, "regularized"); });
+      check("scope and metadata", () => {
+        assert.equal(e.state.data.userId, f.worker.uid); assert.equal(e.state.data.companyId, f.companyId);
+        assert.equal(e.state.data.initializationId, baseline.effects.state.data.initializationId);
+        assert.equal(e.state.data.sourceDigest, baseline.effects.state.data.sourceDigest);
+      });
+      check("resolution identity", () => {
+        const r = e.regs[0]; assert.equal(r.id, f.entryId); assert.equal(r.data.originalEntryId, f.entryId);
+        assert.equal(r.data.adminUid, winningAdmin.uid); assert.equal(r.data.workerUid, f.worker.uid);
+        assert.equal(r.data.companyId, f.companyId); assert.equal(r.data.requestId, f.request.requestId);
+        assert.equal(r.data.reason, f.request.reason); assert.equal(r.data.mode, f.request.mode);
+      });
+      check("complete receipt identity", () => {
+        const r = e.receipts[0]; assert.equal(r.id, keyFor({ ...f, admin: winningAdmin }));
+        assert.equal(r.data.actorUid, winningAdmin.uid); assert.equal(r.data.workerUid, f.worker.uid);
+        assert.equal(r.data.operation, f.request.operation); assert.equal(r.data.requestId, f.request.requestId);
+        assert.equal(r.data.companyId, f.companyId); assert.equal(r.data.result.originalEntryId, f.entryId);
+        assert.equal(r.data.result.stateVersion, 2);
+      });
+      check("dates and accreditation preserved", () => {
+        const r = e.regs[0].data, time = r.accreditedExitAt === null ? null : jsonTime(r.accreditedExitAt);
+        assert.deepEqual(time, f.request.accreditedExitAt); assert.equal(r.evidenceReference, f.request.evidenceReference);
+        assert.deepEqual(e.state.data.lastResolution.exitAt === null ? null : jsonTime(e.state.data.lastResolution.exitAt), time);
+        assert.equal(r.effectiveMinutes, f.request.mode === "accredited_exit" ? 480 : null);
+      });
+      check("three atomic effects", () => {
+        assert.deepEqual(e.state.updateTime, e.regs[0].updateTime); assert.deepEqual(e.state.updateTime, e.receipts[0].updateTime);
+        assert.deepEqual(e.regs[0].data.committedAt, e.receipts[0].data.committedAt);
+        assert.deepEqual(e.state.data.updatedAt, e.regs[0].data.committedAt);
+      });
+    }
+  }
+  if (failures.length) throw new AggregateError(failures.map(label => new Error(label)),
+    "REGULARIZATION_RECOVERY_DIAGNOSTIC " + JSON.stringify({ failures,
+      error: outcome.error ? diagnosticError(outcome.error) : null,
+      result: outcome.value ? { ok: outcome.value.ok, replayed: outcome.value.replayed } : null,
+      effects: snapshots[0].status === "fulfilled" ? { resolutions: snapshots[0].value.regs.length,
+        receipts: snapshots[0].value.receipts.length, logs: snapshots[0].value.logs.length,
+        version: snapshots[0].value.state?.data.version } : null,
+      snapshotReads: snapshots.map(s => s.status) }));
+  return outcome;
+}
+
+for (const mode of ["accredited_exit", "unknown_exit"]) {
+  test("recovery: ABORTED -> INVALID_ARGUMENT starts a fresh regularization, " + mode, async () => {
+    const f = await fixture({ mode }), request = structuredClone(f.request);
+    const { adapter, observed } = recoveryAdapter({ historyErrors: [closedHistory()] });
+    await verifyRecovery(f, () => serviceFor(adapter)({ data: f.request, identity: f.admin.identity }), { changed: true });
+    assert.equal(observed.executions, 2); assert.equal(observed.probes, 1);
+    assert.deepEqual(observed.maxAttempts, [5, 4]); assert.notEqual(observed.transactions[0], observed.transactions[1]);
+    assert.deepEqual(f.request, request);
+    const before = await effects(f), retry = await service({ data: f.request, identity: f.admin.identity });
+    const final = await effects(f);
+    assert.equal(retry.replayed, true); assert.deepEqual(final, before);
+  });
+
+  test("recovery: lost response after actual commit replays one resolution, " + mode, async () => {
+    const f = await fixture({ mode });
+    const { adapter, observed } = recoveryAdapter({ afterCommitErrors: [nativeFault(14, "Fictional lost commit response")] });
+    await verifyRecovery(f, () => invokeRecovery(f, adapter), { changed: true, replayed: true });
+    assert.equal(observed.executions, 1); assert.equal(observed.probes, 1);
+  });
+
+  test("recovery: failed confirmation read after commit remains uncertain, " + mode, async () => {
+    const f = await fixture({ mode });
+    const { adapter, observed } = recoveryAdapter({ afterCommitErrors: [nativeFault(14, "Fictional lost response")],
+      confirmationError: nativeFault(14, "Fictional receipt read failure") });
+    await verifyRecovery(f, () => invokeRecovery(f, adapter), { code: "CONFIRMATION_UNAVAILABLE", changed: true });
+    assert.equal(observed.executions, 1);
+    const before = await effects(f), replay = await service({ data: f.request, identity: f.admin.identity });
+    const after = await effects(f); assert.equal(replay.replayed, true); assert.deepEqual(after, before);
+  });
+
+  test("recovery: uncertain before commit exhausts SDK retries without partial effects, " + mode, async () => {
+    const f = await fixture({ mode });
+    const { adapter, observed } = recoveryAdapter({ beforeCommitErrors: Array.from({ length: 5 }, () => nativeFault(14, "Fictional UNAVAILABLE")) });
+    await verifyRecovery(f, () => invokeRecovery(f, adapter), { code: "CONFIRMATION_UNAVAILABLE" });
+    assert.equal(observed.executions, 1); assert.equal(observed.callbacks, 5); assert.equal(observed.probes, 1);
+  });
+}
+
+test("recovery: two closed histories have distinct native IDs and stop at two executions", async () => {
+  const f = await fixture();
+  const { adapter, observed } = recoveryAdapter({ historyErrors: [closedHistory(), closedHistory()] });
+  await verifyRecovery(f, () => serviceFor(adapter)({ data: f.request, identity: f.admin.identity }), { code: 3 });
+  assert.equal(observed.executions, 2); assert.equal(observed.probes, 2);
+  assert.equal(observed.nativeIds.length, 2); assert.notEqual(observed.nativeIds[0], observed.nativeIds[1]);
+});
+
+test("recovery: commit-origin closed error cannot enable a regularization restart", async () => {
+  const f = await fixture();
+  const { adapter, observed } = recoveryAdapter({ beforeCommitErrors: [closedHistory()] });
+  await verifyRecovery(f, () => serviceFor(adapter)({ data: f.request, identity: f.admin.identity }), { code: 3 });
+  assert.equal(observed.executions, 1);
+});
+
+test("recovery: unrelated native code 3 from history is not retried", async () => {
+  const f = await fixture();
+  const { adapter, observed } = recoveryAdapter({ historyErrors: [nativeFault(3, "Fictional invalid query argument")] });
+  await verifyRecovery(f, () => serviceFor(adapter)({ data: f.request, identity: f.admin.identity }), { code: 3 });
+  assert.equal(observed.executions, 1);
+});
+
+test("recovery: five shared callbacks include SDK attempts on both complete executions", async () => {
+  const f = await fixture();
+  const { adapter, observed } = recoveryAdapter({ historyErrors: [nativeFault(10, "Fictional ABORTED"), nativeFault(10, "Fictional ABORTED"),
+    closedHistory(), nativeFault(10, "Fictional ABORTED"), nativeFault(10, "Fictional ABORTED")] });
+  await verifyRecovery(f, () => serviceFor(adapter)({ data: f.request, identity: f.admin.identity }), { code: 10 });
+  assert.equal(observed.callbacks, 5); assert.equal(observed.executions, 2); assert.equal(observed.probes, 2);
+  assert.deepEqual(observed.maxAttempts, [5, 2]);
+});
+
+test("recovery: unreadable confirmation blocks a fresh execution even after a known read closure", async () => {
+  const f = await fixture();
+  const { adapter, observed } = recoveryAdapter({ historyErrors: [closedHistory()], confirmationError: nativeFault(14, "Fictional read unavailable") });
+  await verifyRecovery(f, () => invokeRecovery(f, adapter), { code: "CONFIRMATION_UNAVAILABLE" });
+  assert.equal(observed.executions, 1);
+});
+
+for (const [label, change, code] of [
+  ["revoked role", f => db.doc("users/" + f.admin.uid).update({ role: "trabajador" }), "FORBIDDEN"],
+  ["changed company", f => db.doc("users/" + f.admin.uid).update({ companyId: "fictional-other-company" }), "COMPANY_MISMATCH"],
+  ["disabled Auth", f => auth.updateUser(f.admin.uid, { disabled: true }), "UNAUTHENTICATED"],
+  ["revoked email", f => auth.updateUser(f.admin.uid, { emailVerified: false }), "EMAIL_NOT_VERIFIED"],
+  ["changed epoch", f => controlRef(f).update({ epoch: 8 }), "EPOCH_CONFLICT"],
+  ["paused mode", f => controlRef(f).update({ writeMode: "paused" }), "SERVICE_PAUSED"],
+  ["legacy mode", f => controlRef(f).update({ writeMode: "legacy" }), "SERVICE_PAUSED"],
+]) test("recovery: " + label + " prevents a new resolution", async () => {
+  const f = await fixture();
+  const { adapter, observed } = recoveryAdapter({ historyErrors: [closedHistory()], onFailure: () => change(f) });
+  await verifyRecovery(f, () => invokeRecovery(f, adapter), { code });
+  assert.equal(observed.executions, 1);
+});
+
+for (const writeMode of ["paused", "legacy"]) test("recovery: valid committed receipt survives " + writeMode + " and epoch change", async () => {
+  const f = await fixture();
+  const { adapter } = recoveryAdapter({ afterCommitErrors: [nativeFault(14, "Fictional lost response")],
+    beforeProbe: () => controlRef(f).update({ writeMode, epoch: 8 }) });
+  await verifyRecovery(f, () => invokeRecovery(f, adapter), { changed: true, replayed: true });
+});
+
+test("recovery: a corrupt receipt is rejected without replacing it or creating a resolution", async () => {
+  const f = await fixture(); let injected;
+  const { adapter, observed } = recoveryAdapter({ historyErrors: [closedHistory()], beforeProbe: async () => {
+    await db.doc("companies/" + f.companyId + "/session_requests/" + keyFor(f)).create({ corrupt: true });
+    injected = await effects(f);
+  } });
+  await verifyRecovery(f, () => invokeRecovery(f, adapter), { code: "INVALID_RECEIPT", compareEffects: e => assert.deepEqual(e, injected) });
+  assert.equal(observed.executions, 1);
+});
+
+test("recovery: genuine incompatible receipt preserves REQUEST_ID_CONFLICT and its exact effects", async () => {
+  const f = await fixture(); let injected;
+  const { adapter, observed } = recoveryAdapter({ historyErrors: [closedHistory()], beforeProbe: async () => {
+    await service({ data: { ...f.request, reason: "Different fictional reviewed reason" }, identity: f.admin.identity });
+    injected = await effects(f);
+  } });
+  await verifyRecovery(f, () => invokeRecovery(f, adapter), { code: "REQUEST_ID_CONFLICT", compareEffects: e => assert.deepEqual(e, injected) });
+  assert.equal(observed.executions, 1);
+});
+
+test("recovery: another admin's same UUID receipt cannot confirm the losing administrator", async () => {
+  const f = await fixture(), second = await actor(f.companyId);
+  const { adapter, observed } = recoveryAdapter({ historyErrors: [closedHistory()], beforeProbe: () => service({ data: f.request, identity: second.identity }) });
+  await verifyRecovery(f, () => invokeRecovery(f, adapter), { code: "VERSION_CONFLICT", changed: true, winningAdmin: second });
+  assert.notEqual(keyFor(f), keyFor({ ...f, admin: second }));
+  assert.equal(observed.executions, 2);
+});
+
+test("recovery: absent probe followed by the same actor's commit replays without duplicate effects", async () => {
+  const f = await fixture();
+  const { adapter, observed } = recoveryAdapter({ historyErrors: [closedHistory()], beforeExecution: async execution => {
+    if (execution === 2) await service({ data: f.request, identity: f.admin.identity });
+  } });
+  await verifyRecovery(f, () => invokeRecovery(f, adapter), { changed: true, replayed: true });
+  assert.equal(observed.executions, 2);
+});
+
+test("recovery: a real state-version change cannot refresh the original request", async () => {
+  const f = await fixture(); let injected;
+  const { adapter, observed } = recoveryAdapter({ historyErrors: [closedHistory()], beforeExecution: async execution => {
+    if (execution === 2) { await stateRef(f).update({ version: 2 }); injected = await effects(f); }
+  } });
+  await verifyRecovery(f, () => invokeRecovery(f, adapter), { code: "VERSION_CONFLICT", compareEffects: e => assert.deepEqual(e, injected) });
+  assert.equal(f.request.expectedStateVersion, 1); assert.equal(observed.executions, 2);
+});
+
+test("recovery: actor, UUID, epoch, reason, evidence and accredited date are detached from caller mutation", async () => {
+  const f = await fixture(), data = structuredClone(f.request), identity = { ...f.admin.identity };
+  const { adapter } = recoveryAdapter({ historyErrors: [closedHistory()], beforeExecution: execution => {
+    if (execution === 1) {
+      identity.uid = "fictional-other-administrator"; data.requestId = randomUUID();
+      data.expectedStateVersion = 99; data.expectedEpoch = 99; data.companyContext = "fictional-other-company";
+      data.reason = "Altered fictional reason"; data.evidenceReference = "altered-evidence"; data.accreditedExitAt.seconds++;
+    }
+  } });
+  await verifyRecovery(f, () => serviceFor(adapter)({ data, identity }), { changed: true });
+});
+
+test("recovery: original token revocation claims are reauthorized before probing", async () => {
+  const f = await fixture(), request = await handlerRequest(f);
+  const { adapter, observed } = recoveryAdapter({ historyErrors: [closedHistory()] });
+  let reads = 0;
+  const handler = createRegularizeSessionHandler({ environment, execute: serviceFor(adapter), HttpsError,
+    readUser: async uid => {
+      const user = await auth.getUser(uid);
+      return ++reads >= 3 ? { ...user, tokensValidAfterTime: new Date((request.auth.token.auth_time + 1) * 1000).toISOString() } : user;
+    } });
+  await verifyRecovery(f, () => handler(request), { code: "UNAUTHENTICATED" });
+  assert.equal(reads, 3); assert.equal(observed.probes, 0);
+});
+
+test("recovery: absent trusted Auth capability prevents automatic recovery", async () => {
+  const f = await fixture();
+  const { adapter, observed } = recoveryAdapter({ historyErrors: [closedHistory()] });
+  const execute = createRegularizeSessionService({ firestore: adapter, environment, now: () => Timestamp.now(),
+    serverTimestamp: () => FieldValue.serverTimestamp(), toTimestamp: ({ seconds, nanoseconds }) => new Timestamp(seconds, nanoseconds) });
+  const handler = handlerFor(input => execute({ data: input.data, identity: input.identity }));
+  await verifyRecovery(f, async () => handler(await handlerRequest(f)), { code: "CONFIRMATION_UNAVAILABLE" });
+  assert.equal(observed.executions, 1); assert.equal(observed.probes, 0);
+});
+
+for (let round = 1; round <= 3; round++) for (const scenario of ["same_uuid_admins", "double_click"]) {
+  test("recovery concurrency repeat " + round + ": " + scenario, async t => {
+    const f = await fixture(), second = scenario === "double_click" ? f.admin : await actor(f.companyId);
+    const baseline = await concurrentBaseline(f);
+    const responses = await Promise.all([
+      captureConcurrentResponse({ label: "administrator-1", actorUid: f.admin.uid, request: f.request, run: () => call(f) }),
+      captureConcurrentResponse({ label: "administrator-2", actorUid: second.uid, request: f.request, run: () => call(f, f.request, second.token) }),
+    ]);
+    const summary = await validateConcurrentRegularization({ f, scenario, responses, baseline, report: message => t.diagnostic(message) });
+    t.diagnostic("REGULARIZATION_RECOVERY_REPEAT " + JSON.stringify({ round, scenario, ...summary }));
+  });
+}
