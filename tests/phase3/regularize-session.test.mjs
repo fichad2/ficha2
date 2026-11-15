@@ -224,14 +224,21 @@ async function validateConcurrentRegularization({ f, scenario, responses, baseli
   return summary;
 }
 for (const mode of ["accredited_exit", "unknown_exit"]) test("atomic administrative resolution: " + mode, async () => {
-  const f = await fixture({ mode }), before = await effects(f), start = Date.now(), response = await call(f), end = Date.now();
+  const f = await fixture({ mode }), before = await effects(f), response = await call(f);
   assert.equal(response.status, 200, JSON.stringify(response)); assert.equal(response.result.ok, true); assert.equal(response.result.replayed, false);
   const e = await effects(f); assert.deepEqual(e.logs, before.logs); assert.equal(e.regs.length, 1); assert.equal(e.receipts.length, 1);
   const reg = e.regs[0].data, receipt = e.receipts[0].data;
   assert.equal(e.regs[0].id, f.entryId); assert.equal(reg.originalEntryId, f.entryId); assert.equal(reg.workerUid, f.worker.uid); assert.equal(reg.companyId, f.companyId);
   assert.equal(reg.adminUid, f.admin.uid); assert.equal(reg.reason, f.request.reason); assert.equal(reg.requestId, f.request.requestId);
   assert.equal(reg.mode, mode); assert.equal(reg.status, mode === "accredited_exit" ? "resolved_known" : "resolved_unknown");
-  assert.ok(reg.regularizedAt instanceof Timestamp); assert.ok(reg.regularizedAt.toMillis() >= start && reg.regularizedAt.toMillis() <= end); assert.ok(reg.committedAt instanceof Timestamp);
+  // Process wall clocks need not agree. Exact clock provenance/precision is
+  // covered by the injected-clock tests below; HTTP retains temporal coherence.
+  assert.ok(reg.regularizedAt instanceof Timestamp); assert.ok(reg.committedAt instanceof Timestamp);
+  assert.deepEqual(jsonTime(e.state.data.lastResolution.regularizedAt), jsonTime(reg.regularizedAt));
+  assert.deepEqual(reg.committedAt, receipt.committedAt);
+  assert.deepEqual(e.state.data.updatedAt, reg.committedAt);
+  assert.deepEqual(e.state.updateTime, e.regs[0].updateTime);
+  assert.deepEqual(e.state.updateTime, e.receipts[0].updateTime);
   assert.equal(reg.effectiveMinutes, mode === "accredited_exit" ? 480 : null);
   if (mode === "accredited_exit") { assert.ok(reg.accreditedExitAt.isEqual(f.exitAt)); assert.equal(reg.evidenceReference, f.request.evidenceReference); }
   else { assert.equal(reg.accreditedExitAt, null); assert.equal(reg.evidenceReference, null); }
@@ -971,5 +978,54 @@ for (let round = 1; round <= 3; round++) for (const scenario of ["same_uuid_admi
     ]);
     const summary = await validateConcurrentRegularization({ f, scenario, responses, baseline, report: message => t.diagnostic(message) });
     t.diagnostic("REGULARIZATION_RECOVERY_REPEAT " + JSON.stringify({ round, scenario, ...summary }));
+  });
+}
+
+// All decision-clock values here are fixed, server-injected and exactly
+// representable as Firestore microseconds. Never replace Date.now/Timestamp.now
+// globally or infer ordering against the emulator's independent commit clock.
+function assertExactRegularizedAt(snapshot, expected) {
+  const actual = snapshot.regs[0].data.regularizedAt;
+  assert.ok(actual instanceof Timestamp);
+  assert.deepEqual(jsonTime(actual), jsonTime(expected));
+  assert.deepEqual(jsonTime(snapshot.state.data.lastResolution.regularizedAt), jsonTime(expected));
+}
+
+for (const mode of ["accredited_exit", "unknown_exit"]) {
+  test("temporal: exact injected regularizedAt and later replay preserve all dates: " + mode, async () => {
+    // Millisecond-aligned opening retains the fixture's exact eight-hour exit.
+    const opened = new Timestamp(1767254400, 123000000);
+    const fixed = new Timestamp(1767430800, 987654000); // More than 49h later; full microsecond precision.
+    const later = new Timestamp(fixed.seconds + 3600, fixed.nanoseconds);
+    const f = await fixture({ mode, openedAt: opened });
+    await verifyRecovery(f, () => serviceFor(db, () => fixed)({ data: f.request, identity: f.admin.identity }), { changed: true });
+    const committed = await effects(f);
+    assertExactRegularizedAt(committed, fixed);
+    // Equality of entire snapshots includes every document's updateTime and
+    // original logs, not just the returned result or the regularization date.
+    await verifyRecovery(f, () => serviceFor(db, () => later)({ data: f.request, identity: f.admin.identity }), { replayed: true });
+    const replayed = await effects(f);
+    assertExactRegularizedAt(replayed, fixed);
+    assert.deepEqual(replayed, committed);
+  });
+
+  test("temporal: only the confirmed attempt's regularizedAt persists: " + mode, async () => {
+    const opened = new Timestamp(1767254400, 123000000);
+    const abortedAt = new Timestamp(1767430800, 123456000);
+    const confirmedAt = new Timestamp(1767430801, 987654000);
+    const f = await fixture({ mode, openedAt: opened });
+    let attempts = 0;
+    const adapter = transactionAdapter((action, options) => db.runTransaction(async tx => {
+      attempts++;
+      const result = await action(tx);
+      if (attempts === 1) throw nativeFault(10, "Fictional temporal ABORTED after staged writes");
+      return result;
+    }, options));
+    const clock = () => attempts === 1 ? abortedAt : confirmedAt;
+    await verifyRecovery(f, () => serviceFor(adapter, clock)({ data: f.request, identity: f.admin.identity }), { changed: true });
+    const committed = await effects(f);
+    assert.equal(attempts, 2);
+    assertExactRegularizedAt(committed, confirmedAt);
+    assert.notDeepEqual(jsonTime(committed.regs[0].data.regularizedAt), jsonTime(abortedAt));
   });
 }
