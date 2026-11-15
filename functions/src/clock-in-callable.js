@@ -33,3 +33,32 @@ export function createClockInHandler({ environment, readUser, execute, HttpsErro
     }
   };
 }
+
+// Only clockOut opts in. Existing entry/regularization authentication and error
+// handling above remain unchanged. The capability is private server context;
+// no request data can supply it or replace the original token's claims.
+export function createClockOutHandler({ environment, readUser, execute, HttpsError }) {
+  return async request => {
+    const uid = request.auth?.uid;
+    const token = Object.freeze({ email_verified: request.auth?.token?.email_verified,
+      auth_time: request.auth?.token?.auth_time });
+    const reauthorize = async identity => {
+      assertEmulatorEnvironment(environment());
+      if (!uid || identity.uid !== uid) throw new ClockInError("UNAUTHENTICATED");
+      let user;
+      try { user = await readUser(uid); }
+      catch (error) {
+        if (["auth/user-not-found", "auth/id-token-revoked", "auth/user-disabled"].includes(error.code)) throw new ClockInError("UNAUTHENTICATED");
+        throw error;
+      }
+      if (user.uid !== uid || user.disabled) throw new ClockInError("UNAUTHENTICATED");
+      if (user.emailVerified !== true || token.email_verified !== true) throw new ClockInError("EMAIL_NOT_VERIFIED");
+      const validAfter = Date.parse(user.tokensValidAfterTime);
+      if (Number.isFinite(validAfter) && (!Number.isFinite(token.auth_time)
+        || token.auth_time * 1000 < validAfter)) throw new ClockInError("UNAUTHENTICATED");
+    };
+    return createClockInHandler({ environment, readUser, HttpsError,
+      execute: input => execute({ ...input, reauthorize }),
+    })({ ...request, auth: uid ? { uid, token } : null });
+  };
+}

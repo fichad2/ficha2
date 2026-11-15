@@ -57,7 +57,7 @@ async function firebaseCli() {
 export async function prepareFunctionsSnapshot(workspace) {
   const destination = path.join(workspace, "functions");
   await mkdir(path.join(destination, "src"), { recursive: true });
-  for (const name of ["session-domain.js", "emulator-environment.js", "emulator-health.js", "clock-in-service.js", "clock-out-service.js", "regularize-session-service.js", "session-transaction-support.js", "clock-in-callable.js", "index.js"]) {
+  for (const name of ["session-domain.js", "emulator-environment.js", "emulator-health.js", "clock-in-service.js", "clock-out-service.js", "regularize-session-service.js", "session-transaction-support.js", "clock-in-callable.js", "session-operation-recovery.js", "index.js"]) {
     await writeFile(path.join(destination, "src", name), await readFile(path.join(root, "functions/src", name)));
   }
   for (const name of ["package.json", "package-lock.json"]) {

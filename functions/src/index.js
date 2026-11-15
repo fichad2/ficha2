@@ -4,7 +4,7 @@ import { assertEmulatorEnvironment } from "./emulator-environment.js";
 import { createRegularizeSessionService } from "./regularize-session-service.js";
 import { createClockOutService } from "./clock-out-service.js";
 import { createClockInService } from "./clock-in-service.js";
-import { createClockInHandler } from "./clock-in-callable.js";
+import { createClockInHandler, createClockOutHandler } from "./clock-in-callable.js";
 import { createHealthHandler } from "./emulator-health.js";
 
 // Fail before importing/initializing Firebase SDKs unless all destinations are
@@ -52,8 +52,8 @@ export const clockIn = onCall({ region: "us-central1", maxInstances: 1 }, create
 
 const executeClockOut = createClockOutService({ firestore, environment, now: () => Timestamp.now(),
   serverTimestamp: () => FieldValue.serverTimestamp() });
-// Entry and exit share the existing authentication/error adapter.
-export const clockOut = onCall({ region: "us-central1", maxInstances: 1 }, createClockInHandler({
+// Exit retains the shared error mapping and adds private Auth revalidation.
+export const clockOut = onCall({ region: "us-central1", maxInstances: 1 }, createClockOutHandler({
   environment, readUser: (uid) => auth.getUser(uid), execute: executeClockOut, HttpsError,
 }));
 
